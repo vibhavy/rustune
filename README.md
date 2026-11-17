@@ -165,6 +165,10 @@ scripts/       macOS .app bundling
 - **`429 Too Many Requests`**: you're probably using a Client ID that other people share.
   Use your own app (step 1).
 
+## License
+
+[MIT](LICENSE) © 2026 Vibhav Yadav
+
 ## Disclaimer
 
 rustune is an unofficial, personal project. It is not affiliated with, endorsed by or
