@@ -33,6 +33,8 @@ const DIM: Color32 = Color32::from_rgb(0x6e, 0x60, 0x5e);
 const TITLEBAR_H: f32 = 32.0;
 /// Size of the menu bar mini player window.
 const MINI_SIZE: Vec2 = Vec2::new(360.0, 172.0);
+/// Extra height of the mini player while it shows lyrics.
+const MINI_LYRICS_H: f32 = 64.0;
 
 /// Starting volume for the SDK player (0..1).
 const DEFAULT_VOLUME: f32 = 0.6;
@@ -277,6 +279,8 @@ pub struct App {
     lyrics_line: Option<usize>,
     /// Now Playing shows lyrics instead of the cover.
     np_lyrics: bool,
+    /// The mini player shows lyrics under the controls.
+    mini_lyrics: bool,
 }
 
 /// What the mini player shows. Updated by the main window every pass.
@@ -292,6 +296,11 @@ struct MiniState {
     seek_drag: Option<f32>,
     /// The window had focus at least once, so losing it means "clicked away".
     focused_once: bool,
+    show_lyrics: bool,
+    /// The playing song's lyrics, once loaded.
+    lyrics: Option<Arc<Lyrics>>,
+    /// Shown instead of lyrics while there are none to show.
+    lyrics_note: &'static str,
 }
 
 impl MiniState {
@@ -315,6 +324,7 @@ enum MiniAct {
     Shuffle,
     Repeat,
     Seek(u32),
+    ToggleLyrics,
 }
 
 impl App {
@@ -388,6 +398,7 @@ impl App {
             lyrics: None,
             lyrics_line: None,
             np_lyrics: false,
+            mini_lyrics: false,
         }
     }
 
@@ -565,6 +576,21 @@ impl App {
         }));
         self.lyrics = Some((n.uri.clone(), LyricsState::Loading));
         self.lyrics_line = None;
+    }
+
+    /// What the mini player's lyrics area shows: the lyrics, or a note instead.
+    fn mini_lyrics_snapshot(&self) -> (Option<Arc<Lyrics>>, &'static str) {
+        let Some(n) = &self.now else { return (None, "Nothing playing") };
+        if n.uri.starts_with("spotify:episode:") {
+            return (None, "Podcasts don't have lyrics");
+        }
+        match self.lyrics.as_ref().filter(|(uri, _)| *uri == n.uri).map(|(_, s)| s) {
+            Some(LyricsState::Ready(l)) if l.synced => (Some(l.clone()), ""),
+            Some(LyricsState::Ready(_)) => (None, "These lyrics aren't synced"),
+            Some(LyricsState::Missing) => (None, "No lyrics for this song"),
+            Some(LyricsState::Failed(_)) => (None, "Couldn't load the lyrics"),
+            None | Some(LyricsState::Loading) => (None, "Finding lyrics…"),
+        }
     }
 
     /// Fetch album/artist tracks for the Now Playing panel (once per track).
@@ -847,7 +873,24 @@ impl App {
     /// from that state and makes egui panic).
     fn show_mini(&mut self, ctx: &egui::Context) {
         let Some(pos) = self.mini else { return };
+        if self.mini_lyrics {
+            self.request_lyrics();
+        }
+        let (lyrics, lyrics_note) = self.mini_lyrics_snapshot();
         if let Ok(mut st) = self.mini_state.lock() {
+            // Lyrics can arrive while the mini player is idle; wake it to show them.
+            let changed = st.show_lyrics != self.mini_lyrics
+                || st.lyrics_note != lyrics_note
+                || match (&st.lyrics, &lyrics) {
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                    (a, b) => a.is_some() != b.is_some(),
+                };
+            if changed {
+                ctx.request_repaint_of(mini_viewport_id());
+            }
+            st.show_lyrics = self.mini_lyrics;
+            st.lyrics = lyrics;
+            st.lyrics_note = lyrics_note;
             st.now = self.now.clone();
             st.playing = self.playing;
             st.loading = self.loading_play.is_some();
@@ -856,9 +899,10 @@ impl App {
             st.shuffle = self.shuffle;
             st.repeat = Some(self.repeat);
         }
+        let size = if self.mini_lyrics { MINI_SIZE + Vec2::new(0.0, MINI_LYRICS_H) } else { MINI_SIZE };
         let mut builder = egui::ViewportBuilder::default()
             .with_title("rustune mini player")
-            .with_inner_size(MINI_SIZE)
+            .with_inner_size(size)
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)
@@ -903,6 +947,7 @@ impl App {
                     self.send(Command::Repeat(self.repeat));
                 }
                 MiniAct::Seek(ms) => self.seek(ms),
+                MiniAct::ToggleLyrics => self.mini_lyrics = !self.mini_lyrics,
             }
         }
     }
@@ -2934,7 +2979,7 @@ fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
     ui.horizontal(|ui| {
         art(ui, st.now.as_ref().and_then(|n| n.cover.as_deref()), 60.0, 14);
         ui.vertical(|ui| {
-            ui.set_width(w - 60.0 - 10.0 - 2.0 * icons::button_side(14.0) - 16.0);
+            ui.set_width(w - 60.0 - 10.0 - 3.0 * icons::button_side(14.0) - 16.0);
             ui.add_space(8.0);
             match &st.now {
                 Some(n) => {
@@ -2953,6 +2998,10 @@ fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
             }
             if icons::button(ui, Icon::Expand, 14.0, DIM, TEXT).on_hover_text("Open rustune").clicked() {
                 acts.push(MiniAct::OpenApp);
+            }
+            let (c, h) = if st.show_lyrics { (ACCENT, ACCENT_HOVER) } else { (DIM, TEXT) };
+            if icons::button(ui, Icon::Lyrics, 14.0, c, h).on_hover_text("Lyrics").clicked() {
+                acts.push(MiniAct::ToggleLyrics);
             }
         });
     });
@@ -3005,7 +3054,41 @@ fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
         st.seek_drag = drag;
         ui.add_sized([40.0, 16.0], egui::Label::new(RichText::new(fmt_ms(dur)).size(11.5).color(MUTED)));
     });
+
+    if st.show_lyrics {
+        mini_lyrics(ui, &st, pos);
+    }
     acts
+}
+
+/// The line being sung (white, up to two rows) and the next sung one (dim), centred.
+fn mini_lyrics(ui: &mut egui::Ui, st: &MiniState, pos: u32) {
+    ui.add_space(8.0);
+    let area = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), MINI_LYRICS_H - 14.0));
+    let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Center)));
+    ui.set_clip_rect(area.intersect(ui.clip_rect()));
+    ui.spacing_mut().item_spacing.y = 2.0;
+    let Some(l) = &st.lyrics else {
+        ui.add_space(14.0);
+        ui.label(RichText::new(st.lyrics_note).size(13.0).color(MUTED));
+        return;
+    };
+    let line = |i: usize| l.lines.get(i).map(|x| if x.text.is_empty() { "♪" } else { x.text.as_str() });
+    let cur = lyrics::current(&l.lines, pos);
+    let next = cur.map_or(0, |c| c + 1);
+    let now = cur.and_then(line).unwrap_or("♪");
+    ui.add(egui::Label::new(RichText::new(now).font(bold(15.0)).color(TEXT)).wrap().selectable(false));
+    // Skip instrumental gaps when previewing what comes next.
+    if let Some(t) = l.lines.iter().skip(next).find(|x| !x.text.is_empty()) {
+        ui.add(egui::Label::new(RichText::new(&t.text).size(13.0).color(DIM)).truncate().selectable(false));
+    }
+    // Wake up when the next line starts (the player otherwise ticks twice a second).
+    if st.playing
+        && let Some(n) = l.lines.get(next)
+    {
+        let wait = n.at_ms.saturating_sub(pos).clamp(16, 500);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(wait as u64));
+    }
 }
 
 // ---- reusable rows/cards ----------------------------------------------------

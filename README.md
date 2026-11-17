@@ -27,9 +27,9 @@ Web Playback SDK**, using **~160 MB** in total while playing.
 - **Home**: cover carousel of your playlists, mood chips, *Jump back in*, your top tracks,
   *More from {artist}*, *Albums for you*, your top artists, recently liked
 - **Search** for songs, artists, albums and playlists
-- **Lyrics** on the Now Playing screen (speech-bubble button) that follow the song line by
-  line; click a line to jump there. They come from [LRCLIB](https://lrclib.net), since
-  Spotify's API has none.
+- **Lyrics** on the Now Playing screen and in the mini player (speech-bubble button) that
+  follow the song line by line; click a line to jump there. They come from
+  [LRCLIB](https://lrclib.net), since Spotify's API has none.
 - **Song pages** with the full album, more by the artist, and their other albums
 - **Now Playing** screen: round cover with a progress ring, blurred backdrop, heart
   (save to Liked Songs), and *Up next / Album / Artist* tabs
