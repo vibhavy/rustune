@@ -32,6 +32,7 @@ pub enum Icon {
     Expand,
     Close,
     Music,
+    Lyrics,
 }
 
 /// Maps 24-unit icon coordinates into `rect`.
@@ -215,6 +216,19 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             p.circle_stroke(g.p(7.0, 18.0), g.scale * 3.0, s);
             p.circle_stroke(g.p(18.0, 16.0), g.scale * 3.0, s);
             line(p, g.pts(&[(10.0, 18.0), (10.0, 5.5), (21.0, 3.5), (21.0, 16.0)]), s);
+        }
+        Icon::Lyrics => {
+            // Speech bubble with a tail at the bottom left, and a quote mark inside.
+            let mut bubble = g.arc(6.0, 7.0, 3.0, 180.0, 270.0);
+            bubble.extend(g.arc(18.0, 7.0, 3.0, 270.0, 360.0));
+            bubble.extend(g.arc(18.0, 14.0, 3.0, 0.0, 90.0));
+            bubble.extend(g.pts(&[(10.5, 17.0), (6.5, 21.0), (7.0, 17.0)]));
+            bubble.extend(g.arc(6.0, 14.0, 3.0, 90.0, 180.0));
+            closed(p, bubble, s);
+            for cx in [9.5, 14.5] {
+                p.circle_filled(g.p(cx, 10.0), g.scale * 1.7, color);
+                line(p, g.pts(&[(cx + 1.6, 10.3), (cx + 1.0, 12.3), (cx - 0.8, 13.6)]), Stroke::new(s.width * 0.8, color));
+            }
         }
     }
 }

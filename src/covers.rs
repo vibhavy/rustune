@@ -35,7 +35,7 @@ pub fn install(ctx: &Context, rt: Handle) {
     let _ = std::fs::create_dir_all(&dir);
     {
         let dir = dir.clone();
-        rt.spawn_blocking(move || prune(&dir));
+        rt.spawn_blocking(move || prune(&dir, DISK_LIMIT));
     }
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -178,12 +178,12 @@ fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
 }
 
 /// Stable across runs and Rust versions (unlike `DefaultHasher`), for file names.
-fn fnv1a(s: &str) -> u64 {
+pub(crate) fn fnv1a(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Keep the disk cache bounded: past the limit, delete the oldest files down to half.
-fn prune(dir: &Path) {
+/// Keep a disk cache bounded: past `limit`, delete the oldest files down to half.
+pub(crate) fn prune(dir: &Path, limit: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<_> = entries
         .flatten()
@@ -193,12 +193,12 @@ fn prune(dir: &Path) {
         })
         .collect();
     let mut total: u64 = files.iter().map(|f| f.1).sum();
-    if total <= DISK_LIMIT {
+    if total <= limit {
         return;
     }
     files.sort_by_key(|f| f.0);
     for (_, len, path) in files {
-        if total <= DISK_LIMIT / 2 {
+        if total <= limit / 2 {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {

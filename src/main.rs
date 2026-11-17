@@ -2,6 +2,7 @@ mod api;
 mod backend;
 mod covers;
 mod icons;
+mod lyrics;
 mod reopen;
 mod sdk;
 mod tray;
