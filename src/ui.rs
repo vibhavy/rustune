@@ -1364,8 +1364,10 @@ impl App {
             .show(ui, |ui| {
                 glass(22, 12).show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
+                    let bar = ui.max_rect();
                     let w = ui.available_width();
-                    let side = (w * 0.27).max(220.0);
+                    let center_w = (w - (w * 0.27).max(220.0) * 2.0).max(280.0);
+                    let side = (w - center_w) / 2.0;
                     ui.horizontal_centered(|ui| {
                         // Left: now playing (click to open the full player)
                         let left = ui
@@ -1393,9 +1395,11 @@ impl App {
                             }
                         }
 
-                        // Center: transport + waveform
-                        let center_w = (w - side * 2.0).max(280.0);
-                        ui.allocate_ui_with_layout(Vec2::new(center_w, 72.0), Layout::top_down(Align::Center), |ui| {
+                        // Center: transport + waveform, on the bar's centre line whatever
+                        // width the left side ends up using.
+                        let center = Rect::from_center_size(bar.center(), Vec2::new(center_w, 72.0));
+                        let builder = egui::UiBuilder::new().max_rect(center).layout(Layout::top_down(Align::Center));
+                        ui.scope_builder(builder, |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             self.controls(
                                 ui,
