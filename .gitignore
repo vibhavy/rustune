@@ -2,3 +2,5 @@
 ._*
 .DS_Store
 /dist
+# Local build settings, including your Spotify Client ID (see README → Setup)
+/.cargo/config.toml

@@ -81,13 +81,18 @@ than the Client ID in this repo.
 6. Optional: under **User Management**, add anyone else who should be able to sign in
    (up to 5 people in Development Mode).
 
-### 2. Use your Client ID
+### 2. Add your Client ID
 
-Replace `WEB_CLIENT_ID` in [`src/backend.rs`](src/backend.rs). If you want to run the SDK
-test, also replace `CLIENT_ID` in [`examples/sdk_spike.rs`](examples/sdk_spike.rs).
+The Client ID is set at build time and isn't stored in the repo. Create
+`.cargo/config.toml` in the project folder (git ignores it):
 
-A Client ID is not a secret: sign-in uses PKCE, so no client secret exists. It's fine to
-commit it.
+```toml
+[env]
+RUSTUNE_CLIENT_ID = "your-client-id"
+```
+
+Instead of the file, you can `export RUSTUNE_CLIENT_ID=...` before building. Without
+either, the build stops with a message pointing here.
 
 ### 3. Run
 
