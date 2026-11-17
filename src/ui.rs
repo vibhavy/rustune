@@ -1,4 +1,4 @@
-use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchResults, TrackRow};
+use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchResults, ShowSummary, TrackRow};
 use crate::backend::{Command, Event, HomeSection, RepeatMode, SongSection, ViewKey};
 use crate::icons::{self, Icon};
 use crate::sdk::{Sdk, SdkMsg};
@@ -35,6 +35,9 @@ const MINI_SIZE: Vec2 = Vec2::new(360.0, 172.0);
 
 /// Starting volume for the SDK player (0..1).
 const DEFAULT_VOLUME: f32 = 0.6;
+
+/// Search runs this long after the last keystroke.
+const TYPEAHEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Mood chips run a search when clicked.
 const MOODS: &[&str] = &[
@@ -126,6 +129,35 @@ enum View {
     Tracks(TrackView),
     Song(SongView),
     NowPlaying,
+    /// "View all" for a Home shelf.
+    Section(SectionPage),
+}
+
+/// Cards per Home shelf; the rest are on its "View all" page.
+const SHELF: usize = 8;
+
+/// The full list behind a Home shelf's "View all".
+#[derive(Clone)]
+enum SectionItems {
+    Tracks(Arc<Vec<TrackRow>>),
+    Episodes(Arc<Vec<TrackRow>>),
+    Albums(Arc<Vec<AlbumSummary>>),
+    Shows(Arc<Vec<ShowSummary>>),
+    Artists(Arc<Vec<ArtistSummary>>),
+}
+
+struct SectionPage {
+    title: String,
+    items: SectionItems,
+}
+
+/// What Home shows: everything, only music, or only podcasts.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum HomeFilter {
+    #[default]
+    All,
+    Music,
+    Podcasts,
 }
 
 #[derive(Default)]
@@ -136,6 +168,15 @@ struct HomeData {
     because: Option<(String, Vec<TrackRow>)>,
     more_from: Vec<(String, Vec<TrackRow>)>,
     albums: Vec<AlbumSummary>,
+    /// None until loaded.
+    shows: Option<Vec<ShowSummary>>,
+    new_episodes: Vec<TrackRow>,
+    saved_episodes: Vec<TrackRow>,
+    discover_artists: Vec<ArtistSummary>,
+    discover_tracks: Vec<TrackRow>,
+    new_releases: Vec<AlbumSummary>,
+    /// (followed show, shows like it)
+    shows_like: Vec<(String, Vec<ShowSummary>)>,
 }
 
 /// Where a clicked track should play from.
@@ -181,6 +222,10 @@ pub struct App {
     search_query: String,
     search: Option<SearchResults>,
     searching: bool,
+    /// The query most recently sent; results for any other query are stale.
+    search_sent: String,
+    /// When the search box was last edited, until that edit has been searched.
+    search_edited: Option<Instant>,
     now: Option<NowPlaying>,
     playing: bool,
     pos_ms: u32,
@@ -201,6 +246,7 @@ pub struct App {
     local_active: bool,
     error: Option<(String, Instant)>,
     np_tab: NpTab,
+    home_filter: HomeFilter,
     /// Album / artist tracks for the Now Playing panel (same shape as a song page).
     np_related: Option<SongView>,
     tray: Option<Tray>,
@@ -293,6 +339,8 @@ impl App {
             search_query: String::new(),
             search: None,
             searching: false,
+            search_sent: String::new(),
+            search_edited: None,
             now: None,
             playing: false,
             pos_ms: 0,
@@ -311,6 +359,7 @@ impl App {
             local_active: false,
             error,
             np_tab: NpTab::Queue,
+            home_filter: HomeFilter::All,
             np_related: None,
             tray,
             tray_rx,
@@ -436,6 +485,20 @@ impl App {
         self.go(View::Song(SongView::new(t.clone())));
     }
 
+    fn open_show(&mut self, sh: &ShowSummary) {
+        self.open_tracks(TrackView {
+            key: ViewKey::Show(sh.id.clone()),
+            title: sh.name.clone(),
+            subtitle: String::new(),
+            image: sh.image.clone(),
+            context_uri: sh.uri.clone(),
+            album_name: sh.name.clone(),
+            tracks: Arc::default(),
+            next_offset: None,
+            loading: true,
+        });
+    }
+
     fn open_album(&mut self, a: &AlbumSummary) {
         self.open_tracks(TrackView {
             key: ViewKey::Album(a.id.clone()),
@@ -470,7 +533,12 @@ impl App {
     }
 
     fn run_search(&mut self, q: &str) {
-        self.search_query = q.to_string();
+        // Keep what the user typed (e.g. a trailing space) if it's the same query.
+        if self.search_query.trim() != q {
+            self.search_query = q.to_string();
+        }
+        self.search_sent = q.to_string();
+        self.search_edited = None;
         self.searching = true;
         if !matches!(self.view, View::Search) {
             self.go(View::Search);
@@ -519,6 +587,14 @@ impl App {
         self.play_track(&t, PlayFrom::List(uris, i as u32));
         if act == RowAct::Open {
             self.open_song(&t);
+        }
+    }
+
+    /// Episodes play from the clicked one onwards; they have no song page to open.
+    fn act_on_episodes(&mut self, episodes: &[TrackRow], i: usize, act: RowAct) {
+        if act != RowAct::None {
+            let uris = episodes.iter().map(|t| t.uri.clone()).collect();
+            self.play_track(&episodes[i].clone(), PlayFrom::List(uris, i as u32));
         }
     }
 
@@ -592,9 +668,11 @@ impl App {
                         }
                     }
                 }
-                Event::SearchResults(r) => {
-                    self.search = Some(r);
-                    self.searching = false;
+                Event::SearchResults { query, results } => {
+                    if query == self.search_sent {
+                        self.search = Some(results);
+                        self.searching = false;
+                    }
                 }
                 Event::Devices(d) => self.devices = d,
                 Event::SdkToken(t) => {
@@ -611,6 +689,15 @@ impl App {
                     }
                     HomeSection::MoreFrom { artist, tracks } => self.home.more_from.push((artist, tracks)),
                     HomeSection::Albums(v) => self.home.albums = v,
+                    HomeSection::Shows(v) => self.home.shows = Some(v),
+                    HomeSection::NewEpisodes(v) => self.home.new_episodes = v,
+                    HomeSection::SavedEpisodes(v) => self.home.saved_episodes = v,
+                    HomeSection::Discover { artists, tracks } => {
+                        self.home.discover_artists = artists;
+                        self.home.discover_tracks = tracks;
+                    }
+                    HomeSection::NewReleases(v) => self.home.new_releases = v,
+                    HomeSection::ShowsLike { seed, shows } => self.home.shows_like.push((seed, shows)),
                 },
                 Event::Song { uri, section } => {
                     // The same song can be open as a page and in Now Playing.
@@ -1063,7 +1150,12 @@ fn logo(ui: &mut egui::Ui, size: f32) {
 
 fn fmt_ms(ms: u32) -> String {
     let s = ms / 1000;
-    format!("{}:{:02}", s / 60, s % 60)
+    if s >= 3600 {
+        // Podcast episodes run for hours.
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }
 
 /// Deterministic pseudo-random bar heights per track, so each song has its own "waveform".
@@ -1214,6 +1306,7 @@ impl eframe::App for App {
                     View::Tracks(_) => self.track_view(ui),
                     View::Song(_) => self.song_view(ui),
                     View::NowPlaying => {}
+                    View::Section(_) => self.section_view(ui),
                 }
             });
         self.error_toast(ui);
@@ -1562,7 +1655,7 @@ impl App {
     // ---- Home ----
 
     fn home_view(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("home").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(heading(format!("Hi, {}", self.first_name()), 28.0));
@@ -1574,136 +1667,291 @@ impl App {
                     }
                 });
             });
-            ui.add_space(16.0);
+            ui.add_space(12.0);
 
-            self.hero(ui);
-
-            ui.add_space(10.0);
-            let mut mood = None;
-            ui.horizontal_wrapped(|ui| {
-                for m in MOODS {
-                    if chip(ui, m, false).clicked() {
-                        mood = Some(*m);
+            ui.horizontal(|ui| {
+                for (f, label) in [(HomeFilter::All, "All"), (HomeFilter::Music, "Music"), (HomeFilter::Podcasts, "Podcasts")] {
+                    if chip(ui, label, self.home_filter == f).clicked() {
+                        self.home_filter = f;
                     }
                 }
             });
-            if let Some(m) = mood {
-                self.run_search(m);
+            ui.add_space(14.0);
+            let music = self.home_filter != HomeFilter::Podcasts;
+            let podcasts = self.home_filter != HomeFilter::Music;
+
+            if music {
+                self.hero(ui);
+
+                ui.add_space(10.0);
+                let mut mood = None;
+                ui.horizontal_wrapped(|ui| {
+                    for m in MOODS {
+                        if chip(ui, m, false).clicked() {
+                            mood = Some(*m);
+                        }
+                    }
+                });
+                if let Some(m) = mood {
+                    self.run_search(m);
+                }
             }
 
             let home = std::mem::take(&mut self.home);
-            if !home.recent.is_empty() {
-                section_title(ui, "Jump back in");
-                if let Some((i, act)) = card_row(ui, "recent", &home.recent) {
-                    self.act_on_list(&home.recent, i, act);
-                }
-            }
-            if !home.top_tracks.is_empty() {
-                section_title(ui, "Your top tracks");
-                let now = self.now.as_ref().map(|n| n.uri.clone());
-                let half = home.top_tracks.len().div_ceil(2);
-                let mut hit = None;
-                ui.columns(2, |cols| {
-                    for (c, col) in cols.iter_mut().enumerate() {
-                        for i in (c * half)..((c + 1) * half).min(home.top_tracks.len()) {
-                            let t = &home.top_tracks[i];
-                            let act = song_row(col, t, None, now.as_deref() == Some(t.uri.as_str()), self.playing, Some(i + 1));
-                            if act != RowAct::None {
-                                hit = Some((i, act));
-                            }
-                        }
+            let mut more: Option<SectionPage> = None;
+            let page = |title: &str, items: SectionItems| Some(SectionPage { title: title.to_string(), items });
+            if music {
+                if !home.recent.is_empty() {
+                    if section_head(ui, "Jump back in", home.recent.len() > SHELF) {
+                        more = page("Jump back in", SectionItems::Tracks(Arc::new(home.recent.clone())));
                     }
-                });
-                if let Some((i, act)) = hit {
-                    self.act_on_list(&home.top_tracks, i, act);
+                    if let Some((i, act)) = card_row(ui, "recent", shelf(&home.recent)) {
+                        self.act_on_list(&home.recent, i, act);
+                    }
                 }
-            }
-            if let Some((artist, tracks)) = home.because.as_ref().filter(|(_, t)| !t.is_empty()) {
-                section_title(ui, &format!("Because you like {artist}"));
-                if let Some((i, act)) = card_row(ui, "because", tracks) {
-                    self.act_on_list(tracks, i, act);
+                if !home.discover_artists.is_empty() {
+                    let title = "Artists you might like";
+                    if section_head(ui, title, home.discover_artists.len() > SHELF) {
+                        more = page(title, SectionItems::Artists(Arc::new(home.discover_artists.clone())));
+                    }
+                    if let Some(i) = artist_row(ui, "discover_artists", shelf(&home.discover_artists)) {
+                        self.run_search(&home.discover_artists[i].name.clone());
+                    }
                 }
-            }
-            for (k, (artist, tracks)) in home.more_from.iter().enumerate() {
-                section_title(ui, &format!("More from {artist}"));
-                if let Some((i, act)) = card_row(ui, &format!("more_from_{k}"), tracks) {
-                    self.act_on_list(tracks, i, act);
+                if !home.discover_tracks.is_empty() {
+                    let title = "Discover new music";
+                    if section_head(ui, title, home.discover_tracks.len() > SHELF) {
+                        more = page(title, SectionItems::Tracks(Arc::new(home.discover_tracks.clone())));
+                    }
+                    if let Some((i, act)) = card_row(ui, "discover", shelf(&home.discover_tracks)) {
+                        self.act_on_list(&home.discover_tracks, i, act);
+                    }
                 }
-            }
-            if !home.albums.is_empty() {
-                section_title(ui, "Albums for you");
-                match album_row(ui, "home_albums", &home.albums) {
-                    Some((i, RowAct::Play)) => self.play_context(home.albums[i].uri.clone()),
-                    Some((i, _)) => self.open_album(&home.albums[i]),
-                    None => {}
+                if !home.new_releases.is_empty() {
+                    let title = "New releases";
+                    if section_head(ui, title, home.new_releases.len() > SHELF) {
+                        more = page(title, SectionItems::Albums(Arc::new(home.new_releases.clone())));
+                    }
+                    match album_row(ui, "new_releases", shelf(&home.new_releases)) {
+                        Some((i, RowAct::Play)) => self.play_context(home.new_releases[i].uri.clone()),
+                        Some((i, _)) => self.open_album(&home.new_releases[i]),
+                        None => {}
+                    }
                 }
-            }
-            if !home.top_artists.is_empty() {
-                section_title(ui, "Your top artists");
-                let mut clicked = None;
-                egui::ScrollArea::horizontal().id_salt("top_artists").show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for a in &home.top_artists {
-                            if artist_bubble(ui, a.image.as_deref(), &a.name) {
-                                clicked = Some(a.name.clone());
+                if !home.top_tracks.is_empty() {
+                    section_title(ui, "Your top tracks");
+                    let now = self.now.as_ref().map(|n| n.uri.clone());
+                    let half = home.top_tracks.len().div_ceil(2);
+                    let mut hit = None;
+                    ui.columns(2, |cols| {
+                        for (c, col) in cols.iter_mut().enumerate() {
+                            for i in (c * half)..((c + 1) * half).min(home.top_tracks.len()) {
+                                let t = &home.top_tracks[i];
+                                let act = song_row(col, t, None, now.as_deref() == Some(t.uri.as_str()), self.playing, Some(i + 1));
+                                if act != RowAct::None {
+                                    hit = Some((i, act));
+                                }
                             }
                         }
                     });
-                });
-                if let Some(name) = clicked {
-                    self.run_search(&name);
+                    if let Some((i, act)) = hit {
+                        self.act_on_list(&home.top_tracks, i, act);
+                    }
+                }
+                if let Some((artist, tracks)) = home.because.as_ref().filter(|(_, t)| !t.is_empty()) {
+                    section_title(ui, &format!("Because you like {artist}"));
+                    if let Some((i, act)) = card_row(ui, "because", tracks) {
+                        self.act_on_list(tracks, i, act);
+                    }
+                }
+                for (k, (artist, tracks)) in home.more_from.iter().enumerate() {
+                    let title = format!("More from {artist}");
+                    if section_head(ui, &title, tracks.len() > SHELF) {
+                        more = page(&title, SectionItems::Tracks(Arc::new(tracks.clone())));
+                    }
+                    if let Some((i, act)) = card_row(ui, &format!("more_from_{k}"), shelf(tracks)) {
+                        self.act_on_list(tracks, i, act);
+                    }
+                }
+                if !home.albums.is_empty() {
+                    let title = "Albums for you";
+                    if section_head(ui, title, home.albums.len() > SHELF) {
+                        more = page(title, SectionItems::Albums(Arc::new(home.albums.clone())));
+                    }
+                    match album_row(ui, "home_albums", shelf(&home.albums)) {
+                        Some((i, RowAct::Play)) => self.play_context(home.albums[i].uri.clone()),
+                        Some((i, _)) => self.open_album(&home.albums[i]),
+                        None => {}
+                    }
+                }
+                if !home.top_artists.is_empty() {
+                    let title = "Your top artists";
+                    if section_head(ui, title, home.top_artists.len() > SHELF) {
+                        more = page(title, SectionItems::Artists(Arc::new(home.top_artists.clone())));
+                    }
+                    if let Some(i) = artist_row(ui, "top_artists", shelf(&home.top_artists)) {
+                        self.run_search(&home.top_artists[i].name.clone());
+                    }
+                }
+                if home.recent.is_empty() && home.top_tracks.is_empty() && home.top_artists.is_empty() {
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Finding suggestions for you…").color(MUTED));
+                    });
                 }
             }
-            if home.recent.is_empty() && home.top_tracks.is_empty() && home.top_artists.is_empty() {
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("Finding suggestions for you…").color(MUTED));
-                });
+            if podcasts && let Some(p) = self.podcast_sections(ui, &home) {
+                more = Some(p);
             }
             self.home = home;
-
-            if !self.playlists.is_empty() {
-                section_title(ui, "Your playlists");
-                let mut open = None;
-                let mut play = None;
-                ui.horizontal_wrapped(|ui| {
-                    for (i, p) in self.playlists.iter().take(12).enumerate() {
-                        match card(ui, p.image.as_deref(), &p.name, &p.owner, 150.0) {
-                            RowAct::Open => open = Some(i),
-                            RowAct::Play => play = Some(i),
-                            RowAct::None => {}
-                        }
-                    }
-                });
-                if let Some(i) = open {
-                    let p = self.playlists[i].clone();
-                    self.open_playlist(&p);
-                }
-                if let Some(i) = play {
-                    self.play_context(self.playlists[i].uri.clone());
-                }
+            if let Some(p) = more {
+                self.go(View::Section(p));
+                return;
             }
 
-            if !self.liked_preview.is_empty() {
-                section_title(ui, "Recently liked");
-                let now = self.now.as_ref().map(|n| n.uri.clone());
-                let mut hit = None;
-                for (i, t) in self.liked_preview.iter().enumerate() {
-                    let act = song_row(ui, t, None, now.as_deref() == Some(t.uri.as_str()), self.playing, None);
-                    if act != RowAct::None {
-                        hit = Some((i, act));
+            if music {
+                if !self.playlists.is_empty() {
+                    section_title(ui, "Your playlists");
+                    // A grid, not `horizontal_wrapped`: framed cards don't wrap, and a row
+                    // wider than the window stopped Home from scrolling.
+                    let list = &self.playlists[..self.playlists.len().min(12)];
+                    let hit = grid(ui, list.len(), 170.0, |ui, i| card(ui, list[i].image.as_deref(), &list[i].name, &list[i].owner, 150.0));
+                    match hit {
+                        Some((i, RowAct::Play)) => self.play_context(self.playlists[i].uri.clone()),
+                        Some((i, _)) => {
+                            let p = self.playlists[i].clone();
+                            self.open_playlist(&p);
+                        }
+                        None => {}
                     }
                 }
-                if let Some((i, act)) = hit {
-                    let t = self.liked_preview[i].clone();
-                    self.play_track(&t, PlayFrom::Context(self.liked_uri()));
-                    if act == RowAct::Open {
-                        self.open_song(&t);
+
+                if !self.liked_preview.is_empty() {
+                    section_title(ui, "Recently liked");
+                    let now = self.now.as_ref().map(|n| n.uri.clone());
+                    let mut hit = None;
+                    for (i, t) in self.liked_preview.iter().enumerate() {
+                        let act = song_row(ui, t, None, now.as_deref() == Some(t.uri.as_str()), self.playing, None);
+                        if act != RowAct::None {
+                            hit = Some((i, act));
+                        }
+                    }
+                    if let Some((i, act)) = hit {
+                        let t = self.liked_preview[i].clone();
+                        self.play_track(&t, PlayFrom::Context(self.liked_uri()));
+                        if act == RowAct::Open {
+                            self.open_song(&t);
+                        }
                     }
                 }
             }
             ui.add_space(16.0);
+        });
+    }
+
+    /// Home's podcast sections: newest episodes of followed shows, the shows, shows like
+    /// them, saved episodes. Returns a "View all" page if one was clicked.
+    fn podcast_sections(&mut self, ui: &mut egui::Ui, home: &HomeData) -> Option<SectionPage> {
+        let Some(shows) = &home.shows else {
+            if self.home_filter == HomeFilter::Podcasts {
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading your podcasts…").color(MUTED));
+                });
+            }
+            return None;
+        };
+        if shows.is_empty() && home.saved_episodes.is_empty() {
+            if self.home_filter == HomeFilter::Podcasts {
+                section_title(ui, "Podcasts");
+                ui.label(RichText::new("Shows you follow on Spotify appear here.").color(MUTED));
+            }
+            return None;
+        }
+        let mut more = None;
+        let page = |title: &str, items: SectionItems| Some(SectionPage { title: title.to_string(), items });
+        let now = self.now.as_ref().map(|n| n.uri.clone());
+
+        let (title, list) = ("New episodes", &home.new_episodes);
+        if !list.is_empty() {
+            if section_head(ui, title, list.len() > 6) {
+                more = page(title, SectionItems::Episodes(Arc::new(list.clone())));
+            }
+            if let Some((i, act)) = episode_rows(ui, &list[..list.len().min(6)], now.as_deref(), self.playing) {
+                self.act_on_episodes(list, i, act);
+            }
+        }
+        let mut show_shelves: Vec<(String, &Vec<ShowSummary>)> = vec![("Your shows".to_string(), shows)];
+        for (seed, like) in &home.shows_like {
+            show_shelves.push((format!("Because you follow {seed}"), like));
+        }
+        for (k, (title, list)) in show_shelves.iter().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            if section_head(ui, title, list.len() > SHELF) {
+                more = page(title, SectionItems::Shows(Arc::new((*list).clone())));
+            }
+            match show_row(ui, &format!("shows_{k}"), shelf(list)) {
+                Some((i, RowAct::Play)) => self.play_context(list[i].uri.clone()),
+                Some((i, _)) => self.open_show(&list[i].clone()),
+                None => {}
+            }
+        }
+        let (title, list) = ("Saved episodes", &home.saved_episodes);
+        if !list.is_empty() {
+            if section_head(ui, title, list.len() > 10) {
+                more = page(title, SectionItems::Episodes(Arc::new(list.clone())));
+            }
+            if let Some((i, act)) = episode_rows(ui, &list[..list.len().min(10)], now.as_deref(), self.playing) {
+                self.act_on_episodes(list, i, act);
+            }
+        }
+        more
+    }
+
+    /// "View all" page for a Home shelf.
+    fn section_view(&mut self, ui: &mut egui::Ui) {
+        let View::Section(p) = &self.view else { return };
+        let (title, items) = (p.title.clone(), p.items.clone());
+        ui.label(heading(&title, 28.0));
+        ui.add_space(12.0);
+        let now = self.now.as_ref().map(|n| n.uri.clone());
+        egui::ScrollArea::vertical().id_salt(("section", &title)).auto_shrink([false, false]).show(ui, |ui| match &items {
+            SectionItems::Tracks(list) | SectionItems::Episodes(list) => {
+                if let Some((i, act)) = episode_rows(ui, list, now.as_deref(), self.playing) {
+                    if matches!(items, SectionItems::Episodes(_)) {
+                        self.act_on_episodes(list, i, act);
+                    } else {
+                        self.act_on_list(list, i, act);
+                    }
+                }
+            }
+            SectionItems::Albums(list) => match grid(ui, list.len(), 170.0, |ui, i| {
+                card(ui, list[i].image.as_deref(), &list[i].name, &list[i].artists, 150.0)
+            }) {
+                Some((i, RowAct::Play)) => self.play_context(list[i].uri.clone()),
+                Some((i, _)) => self.open_album(&list[i].clone()),
+                None => {}
+            },
+            SectionItems::Shows(list) => match grid(ui, list.len(), 170.0, |ui, i| {
+                let sub = format!("{} episodes", list[i].total_episodes);
+                card(ui, list[i].image.as_deref(), &list[i].name, &sub, 150.0)
+            }) {
+                Some((i, RowAct::Play)) => self.play_context(list[i].uri.clone()),
+                Some((i, _)) => self.open_show(&list[i].clone()),
+                None => {}
+            },
+            SectionItems::Artists(list) => {
+                let hit = grid(ui, list.len(), 140.0, |ui, i| {
+                    if artist_bubble(ui, list[i].image.as_deref(), &list[i].name) { RowAct::Open } else { RowAct::None }
+                });
+                if let Some((i, _)) = hit {
+                    self.run_search(&list[i].name.clone());
+                }
+            }
         });
     }
 
@@ -1803,6 +2051,25 @@ impl App {
 
     // ---- Search ----
 
+    /// Typeahead: search once typing pauses. Clearing the box clears the results.
+    fn search_as_you_type(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.search_edited else { return };
+        let wait = TYPEAHEAD_DELAY.saturating_sub(at.elapsed());
+        if !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        self.search_edited = None;
+        let q = self.search_query.trim().to_string();
+        if q.is_empty() {
+            self.search = None;
+            self.search_sent.clear();
+            self.searching = false;
+        } else if q.chars().count() >= 2 && q != self.search_sent {
+            self.run_search(&q);
+        }
+    }
+
     fn search_view(&mut self, ui: &mut egui::Ui) {
         ui.label(heading("Search", 28.0));
         ui.add_space(10.0);
@@ -1820,6 +2087,9 @@ impl App {
                 if self.search.is_none() && self.search_query.is_empty() {
                     resp.request_focus();
                 }
+                if resp.changed() {
+                    self.search_edited = Some(Instant::now());
+                }
                 if resp.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                     && !self.search_query.trim().is_empty()
@@ -1832,6 +2102,7 @@ impl App {
                 }
             });
         });
+        self.search_as_you_type(ui.ctx());
         ui.add_space(12.0);
         let mut mood = None;
         ui.horizontal_wrapped(|ui| {
@@ -1851,7 +2122,7 @@ impl App {
             return;
         };
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("search").auto_shrink([false, false]).show(ui, |ui| {
             if !res.tracks.is_empty() {
                 section_title(ui, "Songs");
                 let now = self.now.as_ref().map(|n| n.uri.clone());
@@ -1936,7 +2207,7 @@ impl App {
         let artist = t.artists.split(", ").next().unwrap_or_default().to_string();
         let current = self.now.as_ref().is_some_and(|n| n.uri == t.uri);
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("song").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 art(ui, t.cover.as_deref().or(t.image.as_deref()), 200.0, 22);
                 ui.add_space(12.0);
@@ -2248,7 +2519,9 @@ impl App {
             ViewKey::Liked => "COLLECTION",
             ViewKey::Playlist(_) => "PLAYLIST",
             ViewKey::Album(_) => "ALBUM",
+            ViewKey::Show(_) => "PODCAST",
         };
+        let is_show = matches!(tv.key, ViewKey::Show(_));
         let tracks = tv.tracks.clone();
         let (loading, next_offset, key, album_name) =
             (tv.loading, tv.next_offset, tv.key.clone(), tv.album_name.clone());
@@ -2270,7 +2543,8 @@ impl App {
                 let count = if tracks.is_empty() {
                     String::new()
                 } else {
-                    format!("{} songs{}", tracks.len(), if next_offset.is_some() { "+" } else { "" })
+                    let what = if is_show { "episodes" } else { "songs" };
+                    format!("{} {what}{}", tracks.len(), if next_offset.is_some() { "+" } else { "" })
                 };
                 let meta: Vec<&str> = [subtitle.as_str(), count.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
                 ui.label(RichText::new(meta.join("  ·  ")).size(14.0).color(MUTED));
@@ -2286,7 +2560,8 @@ impl App {
             ui.spinner();
             return;
         }
-        if let Some((i, open)) = self.track_table(ui, &tracks, image.as_deref(), next_offset.is_some()) {
+        let date_col = if is_show { "RELEASED" } else { "ALBUM" };
+        if let Some((i, open)) = self.track_table(ui, &tracks, image.as_deref(), next_offset.is_some(), date_col) {
             if i == tracks.len() {
                 if let View::Tracks(tv) = &mut self.view {
                     tv.loading = true;
@@ -2296,7 +2571,8 @@ impl App {
                 let mut row = tracks[i].clone();
                 row.cover = row.cover.or_else(|| image.clone());
                 self.play_track(&row, PlayFrom::Context(ctx_uri));
-                if open {
+                // Episodes have no song page.
+                if open && !is_show {
                     self.open_song(&row);
                 }
             }
@@ -2306,7 +2582,15 @@ impl App {
     /// Virtualised track list (only visible rows are laid out). Returns (row, open_song):
     /// double-click plays, clicking the title opens the song page too.
     /// Row `tracks.len()` is the "load more" row.
-    fn track_table(&self, ui: &mut egui::Ui, tracks: &[TrackRow], fallback: Option<&str>, more: bool) -> Option<(usize, bool)> {
+    /// `album_col` names the fourth column ("ALBUM", or "RELEASED" for episodes).
+    fn track_table(
+        &self,
+        ui: &mut egui::Ui,
+        tracks: &[TrackRow],
+        fallback: Option<&str>,
+        more: bool,
+        album_col: &str,
+    ) -> Option<(usize, bool)> {
         let now_uri = self.now.as_ref().map(|n| n.uri.as_str());
         let mut hit = None;
         let rows = tracks.len() + more as usize;
@@ -2321,7 +2605,7 @@ impl App {
             .column(Column::initial(240.0).at_least(80.0).clip(true).resizable(true))
             .column(Column::exact(56.0))
             .header(26.0, |mut h| {
-                for t in ["#", "", "TITLE", "ALBUM", "TIME"] {
+                for t in ["#", "", "TITLE", album_col, "TIME"] {
                     h.col(|ui| {
                         ui.label(RichText::new(t).font(bold(11.0)).color(DIM));
                     });
@@ -2679,6 +2963,101 @@ fn compact_row(ui: &mut egui::Ui, t: &TrackRow, fallback: Option<&str>, current:
 }
 
 /// Glass pill row: rank or art, title/artist, play button. Row click = Open, button = Play.
+/// Song/episode rows; returns the clicked row.
+fn episode_rows(ui: &mut egui::Ui, list: &[TrackRow], now: Option<&str>, playing: bool) -> Option<(usize, RowAct)> {
+    let mut hit = None;
+    for (i, t) in list.iter().enumerate() {
+        let act = song_row(ui, t, None, now == Some(t.uri.as_str()), playing, None);
+        if act != RowAct::None {
+            hit = Some((i, act));
+        }
+    }
+    hit
+}
+
+/// The first `SHELF` items, for a Home shelf.
+fn shelf<T>(v: &[T]) -> &[T] {
+    &v[..v.len().min(SHELF)]
+}
+
+/// Section heading with an optional "View all" link on the right; true when clicked.
+fn section_head(ui: &mut egui::Ui, title: &str, view_all: bool) -> bool {
+    ui.add_space(18.0);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(heading(title, 20.0));
+        if view_all {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Clear of the scroll bar.
+                ui.add_space(10.0);
+                let r = ui.add(
+                    egui::Label::new(RichText::new("View all").font(bold(13.0)).color(MUTED))
+                        .sense(Sense::click())
+                        .selectable(false),
+                );
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                clicked = r.clicked();
+            });
+        }
+    });
+    ui.add_space(6.0);
+    clicked
+}
+
+/// Lays `n` cells out in rows that fit the width (framed cards can't use
+/// `horizontal_wrapped`). Returns the clicked cell and action.
+fn grid(ui: &mut egui::Ui, n: usize, cell_w: f32, mut cell: impl FnMut(&mut egui::Ui, usize) -> RowAct) -> Option<(usize, RowAct)> {
+    let gap = ui.spacing().item_spacing.x;
+    let cols = (((ui.available_width() + gap) / (cell_w + gap)).floor() as usize).max(1);
+    let mut hit = None;
+    for row in (0..n).collect::<Vec<_>>().chunks(cols) {
+        ui.horizontal(|ui| {
+            for &i in row {
+                let act = cell(ui, i);
+                if act != RowAct::None {
+                    hit = Some((i, act));
+                }
+            }
+        });
+        ui.add_space(12.0);
+    }
+    hit
+}
+
+/// Horizontally scrolling row of artist bubbles; returns the clicked index.
+fn artist_row(ui: &mut egui::Ui, id: &str, artists: &[ArtistSummary]) -> Option<usize> {
+    let mut hit = None;
+    egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (i, a) in artists.iter().enumerate() {
+                if artist_bubble(ui, a.image.as_deref(), &a.name) {
+                    hit = Some(i);
+                }
+            }
+        });
+    });
+    hit
+}
+
+/// Horizontally scrolling row of show cards.
+fn show_row(ui: &mut egui::Ui, id: &str, shows: &[ShowSummary]) -> Option<(usize, RowAct)> {
+    let mut hit = None;
+    egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (i, sh) in shows.iter().enumerate() {
+                let sub = format!("{} episodes", sh.total_episodes);
+                let act = card(ui, sh.image.as_deref(), &sh.name, &sub, 150.0);
+                if act != RowAct::None {
+                    hit = Some((i, act));
+                }
+            }
+        });
+    });
+    hit
+}
+
 fn song_row(
     ui: &mut egui::Ui,
     t: &TrackRow,

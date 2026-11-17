@@ -4,7 +4,7 @@
 //! Audio is played by the Web Playback SDK (see `sdk.rs`); this side starts playback on
 //! the SDK's device through the Web API.
 
-use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchResults, TrackRow, WebApi};
+use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchResults, ShowSummary, TrackRow, WebApi};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
 use librespot_core::{
@@ -106,6 +106,8 @@ pub enum ViewKey {
     Liked,
     Playlist(String),
     Album(String),
+    /// A podcast's episodes.
+    Show(String),
 }
 
 #[derive(Debug)]
@@ -148,6 +150,17 @@ pub enum HomeSection {
     MoreFrom { artist: String, tracks: Vec<TrackRow> },
     /// Albums by the user's top artists.
     Albums(Vec<AlbumSummary>),
+    /// Podcasts the user follows (sent even when empty, so the UI stops waiting).
+    Shows(Vec<ShowSummary>),
+    /// The newest episode of each followed show, newest first.
+    NewEpisodes(Vec<TrackRow>),
+    SavedEpisodes(Vec<TrackRow>),
+    /// Artists who work with the user's top artists, and some of their songs.
+    Discover { artists: Vec<ArtistSummary>, tracks: Vec<TrackRow> },
+    /// Albums released in the last two weeks (Spotify's `tag:new`).
+    NewReleases(Vec<AlbumSummary>),
+    /// Shows that come up when searching for one the user follows.
+    ShowsLike { seed: String, shows: Vec<ShowSummary> },
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +180,8 @@ pub enum Event {
     Error(String),
     Playlists(Vec<PlaylistSummary>),
     Tracks { view: ViewKey, tracks: Vec<TrackRow>, append: bool, next_offset: Option<u32> },
-    SearchResults(SearchResults),
+    /// Results tagged with their query, so the UI can drop ones for older queries.
+    SearchResults { query: String, results: SearchResults },
     Devices(Vec<Device>),
     SdkToken(String),
     Home(HomeSection),
@@ -472,6 +486,8 @@ async fn web_command(
             let page = match &view {
                 ViewKey::Liked => api.liked_tracks(&t, offset).await?,
                 ViewKey::Album(id) => api.album_tracks(&t, id, &album_name, offset).await?,
+                // `album_name` carries the show's name here.
+                ViewKey::Show(id) => api.show_episodes(&t, id, &album_name, offset).await?,
                 ViewKey::Playlist(id) => match api.playlist_tracks(&t, id, offset).await {
                     Ok(p) => p,
                     // Web API hides contents of playlists you don't own (and Spotify's own
@@ -498,7 +514,10 @@ async fn web_command(
                 next_offset: page.next_offset,
             });
         }
-        Command::Search(q) => ui.send(Event::SearchResults(api.search(&t, &q).await?)),
+        Command::Search(q) => {
+            let results = api.search(&t, &q).await?;
+            ui.send(Event::SearchResults { query: q, results });
+        }
         Command::LoadDevices => ui.send(Event::Devices(api.devices(&t).await?)),
         Command::TransferTo(id) => api.transfer(&t, &id).await?,
         Command::TransferHere => api.transfer(&t, &device_id()?).await?,
@@ -517,7 +536,9 @@ async fn web_command(
             api.play(&t, &device_id()?, &body).await?;
             log::info!("play request accepted in {:?}", started.elapsed());
         }
-        Command::LoadHome => load_home(ui, api, &t).await,
+        Command::LoadHome => {
+            tokio::join!(load_home(ui, api, &t), load_podcasts(ui, api, &t));
+        }
         Command::LoadSong(track) => load_song(ui, api, &t, track).await,
         Command::LoadQueue => ui.send(Event::Queue(api.queue(&t).await?)),
         Command::CheckSaved(uri) => {
@@ -533,6 +554,77 @@ async fn web_command(
         Command::Login | Command::Logout | Command::SdkToken | Command::SetDevice(_) => {}
     }
     Ok(())
+}
+
+/// Home's podcast sections: followed shows, their newest episodes, saved episodes.
+async fn load_podcasts(ui: &Ui, api: &WebApi, t: &str) {
+    let (shows, saved) = tokio::join!(api.saved_shows(t), api.saved_episodes(t));
+    let shows = shows.unwrap_or_else(|e| {
+        log::warn!("saved shows: {e:#}");
+        Vec::new()
+    });
+    match saved {
+        Ok(v) => ui.send(Event::Home(HomeSection::SavedEpisodes(v))),
+        Err(e) => log::warn!("saved episodes: {e:#}"),
+    }
+    ui.send(Event::Home(HomeSection::Shows(shows.clone())));
+    let seeds: Vec<&ShowSummary> = shows.iter().take(3).collect();
+    let (latest, found) = tokio::join!(
+        join_all(shows.iter().take(12).map(|s| api.latest_episode(t, s))),
+        join_all(seeds.iter().map(|s| api.search_shows(t, &s.name))),
+    );
+    // Searching for a followed show's name brings up similar shows.
+    let mut seen: std::collections::HashSet<String> = shows.iter().map(|s| s.id.clone()).collect();
+    for (seed, res) in seeds.iter().zip(found) {
+        match res {
+            Ok(list) => {
+                let similar = similar_shows(&seed.name, list, &mut seen);
+                if !similar.is_empty() {
+                    ui.send(Event::Home(HomeSection::ShowsLike { seed: seed.name.clone(), shows: similar }));
+                }
+            }
+            Err(e) => log::warn!("shows like {}: {e:#}", seed.name),
+        }
+    }
+    let mut episodes: Vec<(String, TrackRow)> = latest
+        .into_iter()
+        .filter_map(|r| r.map_err(|e| log::warn!("latest episode: {e:#}")).ok().flatten())
+        .collect();
+    episodes.sort_by(|a, b| b.0.cmp(&a.0));
+    ui.send(Event::Home(HomeSection::NewEpisodes(episodes.into_iter().map(|(_, e)| e).collect())));
+}
+
+/// Artists who appear on the given songs' credits but aren't among `known`, most
+/// frequent first (ties keep first-seen order), at most `max`.
+fn collaborators<'a>(credits: impl Iterator<Item = &'a [String]>, known: &[String], max: usize) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for name in credits.flatten() {
+        if known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        match counts.iter_mut().find(|(n, _)| n == name) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((name.clone(), 1)),
+        }
+    }
+    // Stable sort keeps first-seen order among equal counts.
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    counts.into_iter().take(max).map(|(n, _)| n).collect()
+}
+
+/// Search results for a followed show, minus shows already followed or shown, minus
+/// the show's own spin-offs (names that contain, or are contained in, its name), and
+/// minus single-episode uploads (usually clips of other shows).
+fn similar_shows(seed: &str, found: Vec<ShowSummary>, seen: &mut std::collections::HashSet<String>) -> Vec<ShowSummary> {
+    let seed = seed.trim().to_lowercase();
+    found
+        .into_iter()
+        .filter(|s| {
+            let name = s.name.trim().to_lowercase();
+            !name.contains(&seed) && !seed.contains(&name) && s.total_episodes > 1
+        })
+        .filter(|s| seen.insert(s.id.clone()))
+        .collect()
 }
 
 /// Spotify retired its recommendations endpoint for new apps, so suggestions are built
@@ -555,23 +647,32 @@ async fn load_home(ui: &Ui, api: &WebApi, t: &str) {
     ui.send(Event::Home(HomeSection::TopArtists(
         artists.iter().map(|(a, _)| a.clone()).collect(),
     )));
-    // Artist-based suggestions: Spotify often returns artists without genres, so these
-    // don't depend on them.
-    let names: Vec<String> = artists.iter().map(|(a, _)| a.name.clone()).take(3).collect();
-    let track_queries: Vec<String> = names.iter().take(2).map(|n| format!("artist:\"{n}\"")).collect();
-    let album_queries: Vec<String> = names.iter().map(|n| format!("artist:\"{n}\"")).collect();
-    let (tracks, albums) = tokio::join!(
-        join_all(track_queries.iter().map(|q| api.search_tracks(t, q))),
+    // Artist-based suggestions: Spotify no longer returns genres or related artists, so
+    // these come from search. Each top artist's songs list their collaborators, which
+    // seed "Artists you might like".
+    let names: Vec<String> = artists.iter().map(|(a, _)| a.name.clone()).collect();
+    let seeds: Vec<String> = names.iter().take(4).cloned().collect();
+    let album_queries: Vec<String> = names.iter().take(3).map(|n| format!("artist:\"{n}\"")).collect();
+    let song_queries: Vec<String> = seeds.iter().map(|n| format!("artist:\"{n}\"")).collect();
+    let (credits, albums, new) = tokio::join!(
+        join_all(song_queries.iter().map(|q| api.search_track_credits(t, q))),
         join_all(album_queries.iter().map(|q| api.search_albums(t, q))),
+        api.search_albums(t, "tag:new"),
     );
-    for (artist, res) in names.iter().zip(tracks) {
-        match res {
-            Ok(tracks) if !tracks.is_empty() => ui.send(Event::Home(HomeSection::MoreFrom {
+    let credits: Vec<Vec<(TrackRow, Vec<String>)>> = credits
+        .into_iter()
+        .zip(&seeds)
+        .map(|(r, n)| r.unwrap_or_else(|e| {
+            log::warn!("songs by {n}: {e:#}");
+            Vec::new()
+        }))
+        .collect();
+    for (artist, list) in seeds.iter().zip(&credits).take(2) {
+        if !list.is_empty() {
+            ui.send(Event::Home(HomeSection::MoreFrom {
                 artist: artist.clone(),
-                tracks,
-            })),
-            Ok(_) => {}
-            Err(e) => log::warn!("more from {artist}: {e:#}"),
+                tracks: list.iter().map(|(t, _)| t.clone()).collect(),
+            }));
         }
     }
     // Interleave a few albums from each artist.
@@ -586,6 +687,32 @@ async fn load_home(ui: &Ui, api: &WebApi, t: &str) {
     }
     if !mixed.is_empty() {
         ui.send(Event::Home(HomeSection::Albums(mixed)));
+    }
+    match new {
+        Ok(v) if !v.is_empty() => ui.send(Event::Home(HomeSection::NewReleases(v))),
+        Ok(_) => {}
+        Err(e) => log::warn!("new releases: {e:#}"),
+    }
+
+    let picks = collaborators(credits.iter().flatten().map(|(_, a)| a.as_slice()), &names, 6);
+    if !picks.is_empty() {
+        let pick_queries: Vec<String> = picks.iter().take(3).map(|n| format!("artist:\"{n}\"")).collect();
+        let (found, songs) = tokio::join!(
+            join_all(picks.iter().map(|n| api.find_artist(t, n))),
+            join_all(pick_queries.iter().map(|q| api.search_tracks(t, q))),
+        );
+        let artists: Vec<ArtistSummary> = found.into_iter().filter_map(|r| r.ok().flatten()).collect();
+        let lists: Vec<Vec<TrackRow>> = songs.into_iter().filter_map(|r| r.ok()).collect();
+        let known = |t: &TrackRow| names.iter().any(|n| t.artists.split(", ").next() == Some(n.as_str()));
+        let mut tracks: Vec<TrackRow> = Vec::new();
+        for i in 0..4 {
+            for l in &lists {
+                if let Some(tr) = l.get(i).filter(|tr| !known(tr) && !tracks.iter().any(|x| x.uri == tr.uri)) {
+                    tracks.push(tr.clone());
+                }
+            }
+        }
+        ui.send(Event::Home(HomeSection::Discover { artists, tracks }));
     }
 
     if let Some((artist, genres)) = artists.iter().find(|(_, g)| !g.is_empty()) {
@@ -701,4 +828,39 @@ async fn playlist_via_metadata(session: &Session, id: &str) -> Result<Vec<TrackR
     }
     rows.sort_by_key(|(i, _)| *i);
     Ok(rows.into_iter().map(|(_, r)| r).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn collaborators_rank_by_frequency_and_skip_known() {
+        let credits = [names(&["Drake", "Future"]), names(&["Drake", "21 Savage", "Future"]), names(&["Wizkid", "drake"])];
+        let got = collaborators(credits.iter().map(|c| c.as_slice()), &names(&["Drake"]), 2);
+        assert_eq!(got, names(&["Future", "21 Savage"]));
+    }
+
+    fn show(id: &str, name: &str) -> ShowSummary {
+        ShowSummary { id: id.into(), uri: format!("spotify:show:{id}"), name: name.into(), total_episodes: 10, image: None }
+    }
+
+    #[test]
+    fn similar_shows_drop_followed_and_spin_offs() {
+        let mut seen: std::collections::HashSet<String> = ["followed".to_string()].into();
+        let found = vec![
+            show("followed", "Some Show I Follow"),
+            show("a", "Figuring Out with Raj Shamani"),
+            show("b", "Raj Shamani"),
+            show("c", "The Diary Of A CEO"),
+            show("c", "The Diary Of A CEO"),
+            ShowSummary { total_episodes: 1, ..show("d", "Raj Shamani 's Figuring Out clip") },
+        ];
+        let got = similar_shows("Figuring Out with Raj Shamani", found, &mut seen);
+        assert_eq!(got.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["c"]);
+    }
 }
