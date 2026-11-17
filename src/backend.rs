@@ -138,6 +138,8 @@ pub enum Command {
     LoadQueue,
     CheckSaved(String),
     SetSaved { uri: String, saved: bool },
+    /// Lyrics for a song (from LRCLIB, not Spotify, so no sign-in needed).
+    LoadLyrics(crate::lyrics::Query),
 }
 
 #[derive(Debug)]
@@ -188,6 +190,8 @@ pub enum Event {
     Song { uri: String, section: SongSection },
     Queue(Vec<TrackRow>),
     Saved { uri: String, saved: bool },
+    /// `Ok(None)`: the song has no lyrics.
+    Lyrics { uri: String, result: Result<Option<crate::lyrics::Lyrics>, String> },
 }
 
 /// Sends events to the UI and wakes it up.
@@ -378,9 +382,20 @@ async fn run(ui: Ui, mut rx: UnboundedReceiver<Command>) {
                 let _ = std::fs::remove_file(cache_dir().join("credentials.json"));
                 let _ = std::fs::remove_file(refresh_token_path());
                 let _ = std::fs::remove_dir_all(crate::covers::dir());
+                let _ = std::fs::remove_dir_all(crate::lyrics::dir());
                 ui.send(Event::NeedsLogin);
             }
             Command::SetDevice(d) => device = d,
+            Command::LoadLyrics(q) => {
+                let ui = ui.clone();
+                tokio::spawn(async move {
+                    let result = crate::lyrics::fetch(&q).await.map_err(|e| {
+                        log::warn!("lyrics for {}: {e:#}", q.uri);
+                        format!("{e:#}")
+                    });
+                    ui.send(Event::Lyrics { uri: q.uri, result });
+                });
+            }
             Command::SdkToken => match &conn {
                 Some(c) => send_sdk_token(&ui, &c.web).await,
                 // Answered right after sign-in.
@@ -551,7 +566,7 @@ async fn web_command(
         }
         Command::Shuffle(on) => api.shuffle(&t, &device_id()?, on).await?,
         Command::Repeat(mode) => api.repeat(&t, &device_id()?, mode.api_state()).await?,
-        Command::Login | Command::Logout | Command::SdkToken | Command::SetDevice(_) => {}
+        Command::Login | Command::Logout | Command::SdkToken | Command::SetDevice(_) | Command::LoadLyrics(_) => {}
     }
     Ok(())
 }

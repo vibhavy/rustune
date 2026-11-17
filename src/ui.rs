@@ -1,6 +1,7 @@
 use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchResults, ShowSummary, TrackRow};
 use crate::backend::{Command, Event, HomeSection, RepeatMode, SongSection, ViewKey};
 use crate::icons::{self, Icon};
+use crate::lyrics::{self, Lyrics};
 use crate::sdk::{Sdk, SdkMsg};
 use crate::tray::{Tray, TrayMsg};
 use eframe::egui::{
@@ -133,6 +134,15 @@ enum View {
     Section(SectionPage),
 }
 
+#[derive(Clone)]
+enum LyricsState {
+    Loading,
+    Ready(Arc<Lyrics>),
+    /// The song has no lyrics.
+    Missing,
+    Failed(String),
+}
+
 /// Cards per Home shelf; the rest are on its "View all" page.
 const SHELF: usize = 8;
 
@@ -261,6 +271,12 @@ pub struct App {
     mini_state: Arc<Mutex<MiniState>>,
     mini_tx: Sender<MiniAct>,
     mini_rx: Receiver<MiniAct>,
+    /// Lyrics for the song with this URI.
+    lyrics: Option<(String, LyricsState)>,
+    /// The line the lyrics last scrolled to.
+    lyrics_line: Option<usize>,
+    /// Now Playing shows lyrics instead of the cover.
+    np_lyrics: bool,
 }
 
 /// What the mini player shows. Updated by the main window every pass.
@@ -369,6 +385,9 @@ impl App {
             mini_state: Arc::new(Mutex::new(MiniState::default())),
             mini_tx,
             mini_rx,
+            lyrics: None,
+            lyrics_line: None,
+            np_lyrics: false,
         }
     }
 
@@ -515,10 +534,37 @@ impl App {
 
     fn open_now_playing(&mut self) {
         if !matches!(self.view, View::NowPlaying) {
+            // Lyrics start at the current line again.
+            self.lyrics_line = None;
             self.send(Command::LoadQueue);
             self.load_np_related();
             self.go(View::NowPlaying);
         }
+    }
+
+    /// Now Playing with the lyrics showing.
+    fn open_lyrics(&mut self) {
+        self.np_lyrics = true;
+        self.open_now_playing();
+    }
+
+    /// Ask for the playing song's lyrics unless they're loaded or on the way.
+    fn request_lyrics(&mut self) {
+        let Some(n) = &self.now else { return };
+        if n.uri.is_empty() || n.uri.starts_with("spotify:episode:") {
+            return;
+        }
+        if self.lyrics.as_ref().is_some_and(|(uri, _)| *uri == n.uri) {
+            return;
+        }
+        self.send(Command::LoadLyrics(lyrics::Query {
+            uri: n.uri.clone(),
+            name: n.name.clone(),
+            artists: n.artists.clone(),
+            duration_ms: n.duration_ms,
+        }));
+        self.lyrics = Some((n.uri.clone(), LyricsState::Loading));
+        self.lyrics_line = None;
     }
 
     /// Fetch album/artist tracks for the Now Playing panel (once per track).
@@ -719,6 +765,17 @@ impl App {
                 Event::Queue(q) => self.queue = Arc::new(q),
                 Event::Saved { uri, saved } => {
                     self.saved.insert(uri, saved);
+                }
+                Event::Lyrics { uri, result } => {
+                    if let Some((u, state)) = &mut self.lyrics
+                        && *u == uri
+                    {
+                        *state = match result {
+                            Ok(Some(l)) => LyricsState::Ready(Arc::new(l)),
+                            Ok(None) => LyricsState::Missing,
+                            Err(e) => LyricsState::Failed(e),
+                        };
+                    }
                 }
             }
         }
@@ -940,6 +997,19 @@ fn install_fonts(ctx: &egui::Context) {
             p.insert(0, "sf".into());
         }
         bold_family.insert(0, "sf-bold".into());
+    }
+    // SF has no Devanagari, which many Hindi lyrics are written in.
+    let file = std::fs::File::open("/System/Library/Fonts/Kohinoor.ttc");
+    // SAFETY: as above, a read-only system font.
+    if let Ok(map) = file.and_then(|f| unsafe { memmap2::Mmap::map(&f) }) {
+        let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(map);
+        // Faces in the collection: 0 = Regular, 2 = Semibold.
+        fonts.font_data.insert("deva".into(), std::sync::Arc::new(egui::FontData::from_blob(blob.clone(), 0)));
+        fonts.font_data.insert("deva-bold".into(), std::sync::Arc::new(egui::FontData::from_blob(blob, 2)));
+        if let Some(p) = fonts.families.get_mut(&FontFamily::Proportional) {
+            p.insert(1.min(p.len()), "deva".into());
+        }
+        bold_family.insert(1.min(bold_family.len()), "deva-bold".into());
     }
     fonts.families.insert(FontFamily::Name("bold".into()), bold_family);
     ctx.set_fonts(fonts);
@@ -1528,6 +1598,10 @@ impl App {
                                 } else {
                                     self.set_volume(self.volume_before_mute.max(0.1));
                                 }
+                            }
+                            ui.add_space(6.0);
+                            if icons::button(ui, Icon::Lyrics, 17.0, MUTED, TEXT).on_hover_text("Lyrics").clicked() {
+                                self.open_lyrics();
                             }
                         });
                     });
@@ -2328,6 +2402,97 @@ impl App {
 
     // ---- Now Playing ----
 
+    /// Lyrics in place of the cover on the Now Playing screen.
+    fn np_lyrics(&mut self, ui: &mut egui::Ui, rect: Rect, np: &NowPlaying) {
+        self.request_lyrics();
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)));
+        if np.uri.starts_with("spotify:episode:") {
+            lyrics_note(&mut ui, "Podcasts don't have lyrics");
+            return;
+        }
+        let state = self.lyrics.as_ref().filter(|(uri, _)| *uri == np.uri).map(|(_, s)| s.clone());
+        match state {
+            None | Some(LyricsState::Loading) => {
+                lyrics_note(&mut ui, "Finding lyrics…");
+            }
+            Some(LyricsState::Missing) => {
+                lyrics_note(&mut ui, "No lyrics for this song");
+            }
+            Some(LyricsState::Failed(e)) => {
+                lyrics_note(&mut ui, "Couldn't load the lyrics").on_hover_text(e);
+                if ui.link(RichText::new("Try again").color(ACCENT)).clicked() {
+                    self.lyrics = None;
+                }
+            }
+            Some(LyricsState::Ready(l)) => self.lyrics_lines(&mut ui, &l),
+        }
+    }
+
+    /// Synced lyrics highlight the line being sung and keep it in the middle; clicking a
+    /// line jumps there. Unsynced ones are shown as plain text.
+    fn lyrics_lines(&mut self, ui: &mut egui::Ui, l: &Lyrics) {
+        let pos = self.position();
+        let cur = if l.synced { lyrics::current(&l.lines, pos) } else { None };
+        let scroll_to = cur.filter(|&c| self.lyrics_line != Some(c));
+        // Room above the first line and below the last so both can reach the middle.
+        let pad = ui.max_rect().height() * 0.4;
+        let mut seek_to = None;
+        egui::ScrollArea::vertical().id_salt("lyrics").auto_shrink([false, false]).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = if l.synced { 14.0 } else { 6.0 };
+                ui.add_space(if l.synced { pad } else { 8.0 });
+                if !l.synced {
+                    ui.label(RichText::new("These lyrics aren't synced to the song.").size(12.0).color(DIM));
+                    ui.add_space(8.0);
+                }
+                for (i, line) in l.lines.iter().enumerate() {
+                    let text = if line.text.is_empty() { "♪" } else { &line.text };
+                    if !l.synced {
+                        ui.label(RichText::new(text).size(17.0).color(TEXT));
+                        continue;
+                    }
+                    let color = match cur {
+                        Some(c) if i == c => TEXT,
+                        Some(c) if i < c => MUTED,
+                        _ => DIM,
+                    };
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(text).font(bold(24.0)).color(color))
+                            .wrap()
+                            .sense(Sense::click())
+                            .selectable(false),
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        seek_to = Some(line.at_ms);
+                    }
+                    if scroll_to == Some(i) {
+                        resp.scroll_to_me(Some(Align::Center));
+                    }
+                }
+                ui.add_space(20.0);
+                ui.label(RichText::new("Lyrics from LRCLIB").size(11.0).color(DIM));
+                ui.add_space(pad);
+            });
+        });
+        if scroll_to.is_some() {
+            self.lyrics_line = scroll_to;
+        }
+        if let Some(ms) = seek_to {
+            self.seek(ms);
+        }
+        // Wake up exactly when the next line starts.
+        if l.synced && self.playing {
+            let next = cur.map_or(0, |c| c + 1);
+            if let Some(line) = l.lines.get(next) {
+                let wait = line.at_ms.saturating_sub(pos).max(16);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(wait as u64));
+            }
+        }
+    }
+
     fn now_playing_view(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
         let Some(np) = self.now.clone() else {
@@ -2359,44 +2524,63 @@ impl App {
             self.back();
             return;
         }
+        top_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (c, h) = if self.np_lyrics { (ACCENT, ACCENT_HOVER) } else { (MUTED, TEXT) };
+            let tip = if self.np_lyrics { "Show the cover" } else { "Lyrics" };
+            if icons::button(ui, Icon::Lyrics, 20.0, c, h).on_hover_text(tip).clicked() {
+                self.np_lyrics = !self.np_lyrics;
+                self.lyrics_line = None;
+            }
+        });
         ui.painter().text(top.center(), Align2::CENTER_CENTER, "Now Playing", bold(16.0), TEXT);
 
-        // Circular cover with progress ring
+        // Circular cover with progress ring, or the lyrics in its place
         let content_top = top.bottom() + 10.0;
         let avail_h = main.bottom() - content_top;
         let d = (main.width() * 0.42).min(avail_h * 0.44).clamp(160.0, 340.0);
         let center = Pos2::new(main.center().x, content_top + d / 2.0 + 34.0);
-        let p = ui.painter();
         let ring_r = d / 2.0 + 18.0;
-        for i in 0..72 {
-            let a = i as f32 / 72.0 * std::f32::consts::TAU;
-            let dir = Vec2::new(a.cos(), a.sin());
-            p.line_segment(
-                [center + dir * (ring_r + 9.0), center + dir * (ring_r + 13.0)],
-                Stroke::new(1.5, Color32::from_rgba_premultiplied(40, 30, 30, 60)),
+        // Volume buttons sit beside the cover, or at the edges to give lyrics the width.
+        let vol_dx = if self.np_lyrics { main.width() / 2.0 - 44.0 } else { ring_r + 52.0 };
+        if self.np_lyrics {
+            let w = (main.width() - 2.0 * 88.0).min(680.0);
+            let area = Rect::from_min_max(
+                Pos2::new(main.center().x - w / 2.0, content_top + 6.0),
+                Pos2::new(main.center().x + w / 2.0, center.y + ring_r + 22.0),
             );
+            self.np_lyrics(ui, area, &np);
+        } else {
+            let p = ui.painter();
+            for i in 0..72 {
+                let a = i as f32 / 72.0 * std::f32::consts::TAU;
+                let dir = Vec2::new(a.cos(), a.sin());
+                p.line_segment(
+                    [center + dir * (ring_r + 9.0), center + dir * (ring_r + 13.0)],
+                    Stroke::new(1.5, Color32::from_rgba_premultiplied(40, 30, 30, 60)),
+                );
+            }
+            p.circle_stroke(center, ring_r, Stroke::new(3.0, Color32::from_rgba_premultiplied(60, 40, 40, 90)));
+            let dur = np.duration_ms.max(1);
+            let frac = (self.position() as f32 / dur as f32).clamp(0.0, 1.0);
+            if frac > 0.0 {
+                let n = (frac * 120.0).ceil().max(2.0) as usize;
+                let pts: Vec<Pos2> = (0..=n)
+                    .map(|i| {
+                        let a = -std::f32::consts::FRAC_PI_2 + frac * std::f32::consts::TAU * i as f32 / n as f32;
+                        center + Vec2::new(a.cos(), a.sin()) * ring_r
+                    })
+                    .collect();
+                let knob = *pts.last().unwrap();
+                p.add(Shape::line(pts, Stroke::new(3.5, ACCENT)));
+                p.circle_filled(knob, 7.0, Color32::WHITE);
+                p.circle_filled(knob, 4.0, ACCENT);
+            }
+            p.circle_filled(center, d / 2.0 + 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 90));
+            paint_art(ui, Rect::from_center_size(center, Vec2::splat(d)), np.cover.as_deref(), (d / 2.0).min(255.0) as u8);
         }
-        p.circle_stroke(center, ring_r, Stroke::new(3.0, Color32::from_rgba_premultiplied(60, 40, 40, 90)));
-        let dur = np.duration_ms.max(1);
-        let frac = (self.position() as f32 / dur as f32).clamp(0.0, 1.0);
-        if frac > 0.0 {
-            let n = (frac * 120.0).ceil().max(2.0) as usize;
-            let pts: Vec<Pos2> = (0..=n)
-                .map(|i| {
-                    let a = -std::f32::consts::FRAC_PI_2 + frac * std::f32::consts::TAU * i as f32 / n as f32;
-                    center + Vec2::new(a.cos(), a.sin()) * ring_r
-                })
-                .collect();
-            let knob = *pts.last().unwrap();
-            p.add(Shape::line(pts, Stroke::new(3.5, ACCENT)));
-            p.circle_filled(knob, 7.0, Color32::WHITE);
-            p.circle_filled(knob, 4.0, ACCENT);
-        }
-        p.circle_filled(center, d / 2.0 + 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 90));
-        paint_art(ui, Rect::from_center_size(center, Vec2::splat(d)), np.cover.as_deref(), (d / 2.0).min(255.0) as u8);
 
-        // Volume -/+ either side of the cover
-        for (icon, x, delta) in [(Icon::VolumeLow, center.x - ring_r - 52.0, -0.1f32), (Icon::Volume, center.x + ring_r + 52.0, 0.1)] {
+        // Volume -/+
+        for (icon, x, delta) in [(Icon::VolumeLow, center.x - vol_dx, -0.1f32), (Icon::Volume, center.x + vol_dx, 0.1)] {
             let r = Rect::from_center_size(Pos2::new(x, center.y), Vec2::splat(44.0));
             let mut b = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(Layout::left_to_right(Align::Center)));
             if icons::button(&mut b, icon, 20.0, MUTED, TEXT)
@@ -2828,6 +3012,12 @@ fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
 
 /// The window has no visible title bar, so the top strip acts as one: drag to move,
 /// double-click to zoom. Registered first, so real widgets in the strip still win.
+/// A status message in the middle of the lyrics area.
+fn lyrics_note(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_space(ui.max_rect().height() * 0.4);
+    ui.label(RichText::new(text).size(16.0).color(MUTED))
+}
+
 fn titlebar_drag(ui: &mut egui::Ui) {
     let strip = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width(), TITLEBAR_H));
     let resp = ui.interact(strip, egui::Id::unique("titlebar_drag"), Sense::click_and_drag());

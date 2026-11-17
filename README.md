@@ -27,6 +27,9 @@ Web Playback SDK**, using **~160 MB** in total while playing.
 - **Home**: cover carousel of your playlists, mood chips, *Jump back in*, your top tracks,
   *More from {artist}*, *Albums for you*, your top artists, recently liked
 - **Search** for songs, artists, albums and playlists
+- **Lyrics** on the Now Playing screen (speech-bubble button) that follow the song line by
+  line; click a line to jump there. They come from [LRCLIB](https://lrclib.net), since
+  Spotify's API has none.
 - **Song pages** with the full album, more by the artist, and their other albums
 - **Now Playing** screen: round cover with a progress ring, blurred backdrop, heart
   (save to Liked Songs), and *Up next / Album / Artist* tabs
@@ -125,9 +128,12 @@ The icon is drawn in [`assets/icon.svg`](assets/icon.svg). Regenerate the PNGs a
 | Sign-in (refresh token, file mode `0600`) | `~/Library/Caches/rustune/web_token_v3` |
 | librespot login for the playlist fallback | `~/Library/Caches/rustune/credentials.json` |
 | Cover art, so it loads instantly next time (capped at 100 MB) | `~/Library/Caches/rustune/covers/` |
+| Lyrics you've opened (capped at 10 MB) | `~/Library/Caches/rustune/lyrics/` |
 
-**Sign out** (bottom of the sidebar) deletes all three. Nothing else is stored, and
-nothing is sent anywhere except Spotify.
+**Sign out** (bottom of the sidebar) deletes all four. Nothing else is stored, and
+nothing is sent anywhere except Spotify, with one exception: while the lyrics view is
+open, the playing song's title, artist and length go to [LRCLIB](https://lrclib.net) to
+find its lyrics.
 
 ## Limitations
 
@@ -142,7 +148,7 @@ Spotify restricts apps in Development Mode (changes from February 2026):
 
 Also:
 
-- macOS only. Offline downloads, lyrics and podcasts are not supported or tested.
+- macOS only. Offline downloads are not supported.
 - The librespot fallback uses Spotify's internal APIs. It is unofficial and may break.
 
 ## Project layout
@@ -154,6 +160,7 @@ src/
   icons.rs     vector icon set drawn with the egui painter
   sdk.rs       hidden WKWebView + Web Playback SDK bridge
   covers.rs    cover art loading: pooled downloads, disk cache, texture eviction
+  lyrics.rs    lyrics lookup on LRCLIB, LRC parsing, disk cache
   tray.rs      menu bar icon and menu
   reopen.rs    Dock icon click brings the window back
   backend.rs   sign-in, commands/events, suggestions, librespot fallback
