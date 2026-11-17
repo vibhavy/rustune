@@ -10,8 +10,8 @@
 
 ---
 
-The official Spotify desktop app is a bundled Chromium browser. On the author's Mac it
-used **~800 MB** across 8 processes. rustune draws its UI natively with
+The official Spotify desktop app is a bundled Chromium browser that uses **~800 MB**
+across 8 processes. rustune draws its UI natively with
 [egui](https://github.com/emilk/egui) and plays audio through Spotify's **official
 Web Playback SDK**, using **~160 MB** in total while playing.
 
