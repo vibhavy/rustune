@@ -124,9 +124,10 @@ The icon is drawn in [`assets/icon.svg`](assets/icon.svg). Regenerate the PNGs a
 |---|---|
 | Sign-in (refresh token, file mode `0600`) | `~/Library/Caches/rustune/web_token_v3` |
 | librespot login for the playlist fallback | `~/Library/Caches/rustune/credentials.json` |
+| Cover art, so it loads instantly next time (capped at 100 MB) | `~/Library/Caches/rustune/covers/` |
 
-**Sign out** (bottom of the sidebar) deletes both. Nothing else is stored, and nothing is
-sent anywhere except Spotify.
+**Sign out** (bottom of the sidebar) deletes all three. Nothing else is stored, and
+nothing is sent anywhere except Spotify.
 
 ## Limitations
 
@@ -152,6 +153,9 @@ src/
   ui.rs        all screens (egui)
   icons.rs     vector icon set drawn with the egui painter
   sdk.rs       hidden WKWebView + Web Playback SDK bridge
+  covers.rs    cover art loading: pooled downloads, disk cache, texture eviction
+  tray.rs      menu bar icon and menu
+  reopen.rs    Dock icon click brings the window back
   backend.rs   sign-in, commands/events, suggestions, librespot fallback
   api.rs       Spotify Web API client
 examples/

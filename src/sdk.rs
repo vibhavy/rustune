@@ -16,7 +16,7 @@ use std::{
     sync::mpsc::Sender,
 };
 use wry::{
-    WebView, WebViewBuilder,
+    BackgroundThrottlingPolicy, WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
 };
 
@@ -61,6 +61,9 @@ impl Sdk {
         let webview = WebViewBuilder::new()
             .with_url(format!("http://127.0.0.1:{port}/"))
             .with_autoplay(true)
+            // Keep the player running at full speed while the window is closed to the
+            // menu bar or minimised.
+            .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
             // 1×1 px in the window's (rounded, transparent) top-left corner. It stays
             // "visible" on purpose: WebKit throttles hidden pages' timers, which slowed
             // the SDK's start of playback.

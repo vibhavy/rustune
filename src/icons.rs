@@ -29,6 +29,8 @@ pub enum Icon {
     ChevronDown,
     Back10,
     Fwd10,
+    Expand,
+    Close,
     Music,
 }
 
@@ -198,6 +200,16 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             line(p, arc, s);
             line(p, vec![tip - dir * l + normal * l, tip, tip - dir * l - normal * l], s);
             p.text(g.p(12.0, 13.0), Align2::CENTER_CENTER, "10", FontId::proportional(g.scale * 7.0), color);
+        }
+        Icon::Expand => {
+            line(p, g.pts(&[(14.5, 3.5), (20.5, 3.5), (20.5, 9.5)]), s);
+            line(p, g.pts(&[(20.5, 3.5), (13.5, 10.5)]), s);
+            line(p, g.pts(&[(9.5, 20.5), (3.5, 20.5), (3.5, 14.5)]), s);
+            line(p, g.pts(&[(3.5, 20.5), (10.5, 13.5)]), s);
+        }
+        Icon::Close => {
+            line(p, g.pts(&[(6.0, 6.0), (18.0, 18.0)]), s);
+            line(p, g.pts(&[(18.0, 6.0), (6.0, 18.0)]), s);
         }
         Icon::Music => {
             p.circle_stroke(g.p(7.0, 18.0), g.scale * 3.0, s);
