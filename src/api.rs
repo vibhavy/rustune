@@ -44,6 +44,16 @@ pub struct AlbumSummary {
     pub image: Option<String>,
 }
 
+/// A podcast the user follows.
+#[derive(Clone, Debug)]
+pub struct ShowSummary {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub total_episodes: u32,
+    pub image: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ArtistSummary {
     pub uri: String,
@@ -101,6 +111,45 @@ struct RawAlbumRef {
     id: Option<String>,
     name: String,
     images: Option<Vec<Image>>,
+}
+
+#[derive(Deserialize)]
+struct RawShow {
+    id: String,
+    uri: String,
+    name: String,
+    #[serde(default)]
+    total_episodes: u32,
+    images: Option<Vec<Image>>,
+}
+
+#[derive(Deserialize)]
+struct SavedShow {
+    show: Option<RawShow>,
+}
+
+#[derive(Deserialize)]
+struct ShowRef {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RawEpisode {
+    uri: String,
+    name: String,
+    #[serde(default)]
+    duration_ms: u32,
+    #[serde(default)]
+    release_date: String,
+    is_playable: Option<bool>,
+    images: Option<Vec<Image>>,
+    /// Only present when the episode isn't listed under its show.
+    show: Option<ShowRef>,
+}
+
+#[derive(Deserialize)]
+struct SavedEpisode {
+    episode: Option<RawEpisode>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +225,7 @@ struct RawSearch {
     albums: Option<Page<RawAlbum>>,
     artists: Option<Page<RawArtist>>,
     playlists: Option<Page<RawPlaylist>>,
+    shows: Option<Page<RawShow>>,
 }
 
 #[derive(Deserialize)]
@@ -234,6 +284,44 @@ impl From<RawTrack> for TrackRow {
             name: t.name,
             duration_ms: t.duration_ms,
         }
+    }
+}
+
+impl From<RawShow> for ShowSummary {
+    fn from(s: RawShow) -> Self {
+        ShowSummary {
+            image: first_image(s.images),
+            id: s.id,
+            uri: s.uri,
+            name: s.name,
+            total_episodes: s.total_episodes,
+        }
+    }
+}
+
+/// Episodes reuse `TrackRow`: the show goes where the artist would, the release date
+/// where the album would. They have no album or artist ids.
+fn episode_row(e: RawEpisode, show: &str) -> TrackRow {
+    TrackRow {
+        artists: e.show.map(|s| s.name).unwrap_or_else(|| show.to_string()),
+        album: fmt_date(&e.release_date),
+        image: pick_image(&e.images, 64),
+        cover: pick_image(&e.images, 300),
+        album_id: None,
+        artist_id: None,
+        uri: e.uri,
+        name: e.name,
+        duration_ms: e.duration_ms,
+    }
+}
+
+/// "2026-11-14" → "14 Nov 2026"; other precisions ("2026", "2026-11") pass through.
+fn fmt_date(d: &str) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut it = d.splitn(3, '-');
+    match (it.next(), it.next().and_then(|m| m.parse::<usize>().ok()), it.next().and_then(|x| x.parse::<u32>().ok())) {
+        (Some(y), Some(m @ 1..=12), Some(day)) => format!("{day} {} {y}", MONTHS[m - 1]),
+        _ => d.to_string(),
     }
 }
 
@@ -344,6 +432,50 @@ impl WebApi {
             out.extend(page.items.into_iter().flatten().map(Into::into));
         }
         Ok(out)
+    }
+
+    pub async fn saved_shows(&self, token: &str) -> Result<Vec<ShowSummary>> {
+        let page: Page<SavedShow> = self.get(token, &format!("{BASE}/me/shows?limit=50")).await?;
+        Ok(page.items.into_iter().flatten().filter_map(|i| i.show.map(Into::into)).collect())
+    }
+
+    pub async fn saved_episodes(&self, token: &str) -> Result<Vec<TrackRow>> {
+        let page: Page<SavedEpisode> = self.get(token, &format!("{BASE}/me/episodes?limit=20")).await?;
+        Ok(page
+            .items
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.episode)
+            .filter(|e| e.is_playable != Some(false))
+            .map(|e| episode_row(e, ""))
+            .collect())
+    }
+
+    /// Newest first, as Spotify lists them.
+    pub async fn show_episodes(&self, token: &str, id: &str, show: &str, offset: u32) -> Result<TrackPage> {
+        let url = format!("{BASE}/shows/{id}/episodes?limit=50&offset={offset}");
+        let page: Page<RawEpisode> = self.get(token, &url).await?;
+        let next_offset = next_offset(&page);
+        let tracks = page
+            .items
+            .into_iter()
+            .flatten()
+            .filter(|e| e.is_playable != Some(false))
+            .map(|e| episode_row(e, show))
+            .collect();
+        Ok(TrackPage { tracks, next_offset })
+    }
+
+    /// The show's newest episode with its raw release date ("YYYY-MM-DD"), for sorting.
+    pub async fn latest_episode(&self, token: &str, show: &ShowSummary) -> Result<Option<(String, TrackRow)>> {
+        let url = format!("{BASE}/shows/{}/episodes?limit=1", show.id);
+        let page: Page<RawEpisode> = self.get(token, &url).await?;
+        Ok(page
+            .items
+            .into_iter()
+            .flatten()
+            .find(|e| e.is_playable != Some(false))
+            .map(|e| (e.release_date.clone(), episode_row(e, &show.name))))
     }
 
     pub async fn liked_tracks(&self, token: &str, offset: u32) -> Result<TrackPage> {
@@ -505,6 +637,62 @@ impl WebApi {
             .unwrap_or_default())
     }
 
+    /// Track search that also returns each track's artist names (for finding
+    /// collaborators of an artist).
+    pub async fn search_track_credits(&self, token: &str, query: &str) -> Result<Vec<(TrackRow, Vec<String>)>> {
+        let req = self
+            .http
+            .get(format!("{BASE}/search"))
+            .bearer_auth(token)
+            .query(&[("q", query), ("type", "track"), ("limit", "10")]);
+        let raw: RawSearch = self.send(req).await?.json().await?;
+        Ok(raw
+            .tracks
+            .map(|p| {
+                p.items
+                    .into_iter()
+                    .flatten()
+                    .map(|t| {
+                        let names = t.artists.iter().map(|a| a.name.clone()).collect();
+                        (TrackRow::from(t), names)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The artist with this name (exact match preferred), for their picture.
+    pub async fn find_artist(&self, token: &str, name: &str) -> Result<Option<ArtistSummary>> {
+        let query = format!("artist:\"{name}\"");
+        let req = self
+            .http
+            .get(format!("{BASE}/search"))
+            .bearer_auth(token)
+            .query(&[("q", query.as_str()), ("type", "artist"), ("limit", "5")]);
+        let raw: RawSearch = self.send(req).await?.json().await?;
+        let mut found: Vec<RawArtist> = raw.artists.map(|p| p.items.into_iter().flatten().collect()).unwrap_or_default();
+        let i = found.iter().position(|a| a.name.eq_ignore_ascii_case(name)).unwrap_or(0);
+        if found.is_empty() {
+            return Ok(None);
+        }
+        let a = found.swap_remove(i);
+        Ok(Some(ArtistSummary { image: pick_image(&a.images, 300), uri: a.uri, name: a.name }))
+    }
+
+    /// Podcast search, max 10.
+    pub async fn search_shows(&self, token: &str, query: &str) -> Result<Vec<ShowSummary>> {
+        let req = self
+            .http
+            .get(format!("{BASE}/search"))
+            .bearer_auth(token)
+            .query(&[("q", query), ("type", "show"), ("limit", "10")]);
+        let raw: RawSearch = self.send(req).await?.json().await?;
+        Ok(raw
+            .shows
+            .map(|p| p.items.into_iter().flatten().map(Into::into).collect())
+            .unwrap_or_default())
+    }
+
     /// Album search (e.g. `artist:"Name"`), max 10.
     pub async fn search_albums(&self, token: &str, query: &str) -> Result<Vec<AlbumSummary>> {
         let req = self
@@ -588,5 +776,19 @@ impl WebApi {
             .json(&serde_json::json!({ "device_ids": [device_id], "play": true }));
         self.send(req).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_date;
+
+    #[test]
+    fn release_dates() {
+        assert_eq!(fmt_date("2026-11-14"), "14 Nov 2026");
+        assert_eq!(fmt_date("2026-01-03"), "3 Jan 2026");
+        assert_eq!(fmt_date("2026"), "2026");
+        assert_eq!(fmt_date("2026-11"), "2026-11");
+        assert_eq!(fmt_date(""), "");
     }
 }
