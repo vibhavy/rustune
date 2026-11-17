@@ -13,7 +13,11 @@ use tao::{
 };
 use wry::WebViewBuilder;
 
-const CLIENT_ID: &str = "7182acf66a5546c2b436b12d9e43b810";
+/// Same build-time setting as the app (see README → Setup).
+const CLIENT_ID: &str = match option_env!("RUSTUNE_CLIENT_ID") {
+    Some(id) if !id.is_empty() => id,
+    _ => panic!("RUSTUNE_CLIENT_ID is not set: add your Spotify Client ID to .cargo/config.toml (see README → Setup)"),
+};
 const PORT: u16 = 8899;
 /// "Beneath the Sakura Sky", from the user's Liked Songs.
 const TRACK: &str = "spotify:track:3FHMLwjA5KqxAbDDfmzBT1";

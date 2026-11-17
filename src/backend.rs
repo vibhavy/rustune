@@ -22,10 +22,20 @@ use std::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
-/// rustune's own Spotify app (Development Mode), used for everything except the
-/// optional librespot metadata session.
-/// Not a secret: OAuth here uses PKCE, so no client secret is involved.
-const WEB_CLIENT_ID: &str = "7182acf66a5546c2b436b12d9e43b810";
+/// Your Spotify app's Client ID, used for everything except the optional librespot
+/// metadata session. Set at build time (see README → Setup), e.g. in a git-ignored
+/// `.cargo/config.toml`:
+///
+/// ```toml
+/// [env]
+/// RUSTUNE_CLIENT_ID = "your-client-id"
+/// ```
+///
+/// Not a secret: sign-in uses PKCE, so no client secret is involved.
+const WEB_CLIENT_ID: &str = match option_env!("RUSTUNE_CLIENT_ID") {
+    Some(id) if !id.is_empty() => id,
+    _ => panic!("RUSTUNE_CLIENT_ID is not set: add your Spotify Client ID to .cargo/config.toml (see README → Setup)"),
+};
 /// `streaming` + `user-read-email` are required by the Web Playback SDK.
 const WEB_SCOPES: &[&str] = &[
     "streaming",
