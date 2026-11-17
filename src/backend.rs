@@ -296,20 +296,20 @@ fn web_oauth_client(client_id: &str) -> Result<OAuthClient> {
     oauth_client(client_id, WEB_SCOPES)
 }
 
-pub fn spawn(ctx: eframe::egui::Context, tx: Sender<Event>) -> UnboundedSender<Command> {
+/// Starts the backend thread. Also returns its runtime, which the cover loader shares.
+pub fn spawn(ctx: eframe::egui::Context, tx: Sender<Event>) -> (UnboundedSender<Command>, tokio::runtime::Handle) {
     let (cmd_tx, cmd_rx) = unbounded_channel();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let handle = rt.handle().clone();
     std::thread::Builder::new()
         .name("rustune-backend".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            rt.block_on(run(Ui { tx, ctx }, cmd_rx));
-        })
+        .spawn(move || rt.block_on(run(Ui { tx, ctx }, cmd_rx)))
         .expect("spawn backend thread");
-    cmd_tx
+    (cmd_tx, handle)
 }
 
 fn cache_dir() -> PathBuf {
@@ -363,6 +363,7 @@ async fn run(ui: Ui, mut rx: UnboundedReceiver<Command>) {
                 }
                 let _ = std::fs::remove_file(cache_dir().join("credentials.json"));
                 let _ = std::fs::remove_file(refresh_token_path());
+                let _ = std::fs::remove_dir_all(crate::covers::dir());
                 ui.send(Event::NeedsLogin);
             }
             Command::SetDevice(d) => device = d,

@@ -8,18 +8,21 @@ license = "MIT"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 eframe = "0.37"
-egui_extras = { version = "0.37", features = ["all_loaders"] }
+egui_extras = "0.37"
 env_logger = "0.11.11"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 librespot-core = { version = "0.8.0", default-features = false, features = ["native-tls"] }
 librespot-metadata = "0.8.0"
 librespot-oauth = "0.8.0"
 log = "0.4.35"
+memmap2 = "0.9.12"
+objc2 = "0.6"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "native-tls", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tray-icon = "0.26"
 wry = "0.57"
 
 [dev-dependencies]

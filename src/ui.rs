@@ -2,12 +2,18 @@ use crate::api::{AlbumSummary, ArtistSummary, Device, PlaylistSummary, SearchRes
 use crate::backend::{Command, Event, HomeSection, RepeatMode, SongSection, ViewKey};
 use crate::icons::{self, Icon};
 use crate::sdk::{Sdk, SdkMsg};
+use crate::tray::{Tray, TrayMsg};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, Mesh,
     Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-use std::{collections::HashMap, sync::mpsc::Receiver, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::mpsc::{Receiver, Sender},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 // ---- palette: warm maroon → black, coral accent, frosted-glass surfaces ----
@@ -21,6 +27,11 @@ const ACCENT_HOVER: Color32 = Color32::from_rgb(0xff, 0x6a, 0x60);
 const TEXT: Color32 = Color32::from_rgb(0xf6, 0xee, 0xec);
 const MUTED: Color32 = Color32::from_rgb(0xb3, 0xa1, 0x9e);
 const DIM: Color32 = Color32::from_rgb(0x6e, 0x60, 0x5e);
+
+/// Height of the transparent title bar the content runs under (traffic lights live here).
+const TITLEBAR_H: f32 = 32.0;
+/// Size of the menu bar mini player window.
+const MINI_SIZE: Vec2 = Vec2::new(360.0, 172.0);
 
 /// Starting volume for the SDK player (0..1).
 const DEFAULT_VOLUME: f32 = 0.6;
@@ -80,17 +91,18 @@ struct TrackView {
     image: Option<String>,
     context_uri: String,
     album_name: String,
-    tracks: Vec<TrackRow>,
+    /// Shared so drawing a long list each frame doesn't copy it.
+    tracks: Arc<Vec<TrackRow>>,
     next_offset: Option<u32>,
     loading: bool,
 }
 
 struct SongView {
     track: TrackRow,
-    album: Option<Vec<TrackRow>>,
-    by_artist: Option<Vec<TrackRow>>,
-    albums: Option<Vec<AlbumSummary>>,
-    similar: Option<(String, Vec<TrackRow>)>,
+    album: Option<Arc<Vec<TrackRow>>>,
+    by_artist: Option<Arc<Vec<TrackRow>>>,
+    albums: Option<Arc<Vec<AlbumSummary>>>,
+    similar: Option<Arc<(String, Vec<TrackRow>)>>,
 }
 
 impl SongView {
@@ -100,10 +112,10 @@ impl SongView {
 
     fn apply(&mut self, section: SongSection) {
         match section {
-            SongSection::Album(v) => self.album = Some(v),
-            SongSection::Artist(v) => self.by_artist = Some(v),
-            SongSection::ArtistAlbums(v) => self.albums = Some(v),
-            SongSection::Similar { genre, tracks } => self.similar = Some((genre, tracks)),
+            SongSection::Album(v) => self.album = Some(Arc::new(v)),
+            SongSection::Artist(v) => self.by_artist = Some(Arc::new(v)),
+            SongSection::ArtistAlbums(v) => self.albums = Some(Arc::new(v)),
+            SongSection::Similar { genre, tracks } => self.similar = Some(Arc::new((genre, tracks))),
         }
     }
 }
@@ -179,7 +191,7 @@ pub struct App {
     shuffle: bool,
     repeat: RepeatMode,
     devices: Vec<Device>,
-    queue: Vec<TrackRow>,
+    queue: Arc<Vec<TrackRow>>,
     saved: HashMap<String, bool>,
     /// Set when the user asks to play something; cleared when the SDK starts playing.
     loading_play: Option<Instant>,
@@ -191,6 +203,56 @@ pub struct App {
     np_tab: NpTab,
     /// Album / artist tracks for the Now Playing panel (same shape as a song page).
     np_related: Option<SongView>,
+    tray: Option<Tray>,
+    tray_rx: Receiver<TrayMsg>,
+    /// Main window closed to the menu bar (music keeps playing).
+    main_hidden: bool,
+    /// Set by "Quit": lets the close request through instead of hiding.
+    quitting: bool,
+    /// Mini player window: Some(position) while open.
+    mini: Option<Option<Pos2>>,
+    /// Snapshot the mini player window draws from (it runs as its own deferred viewport).
+    mini_state: Arc<Mutex<MiniState>>,
+    mini_tx: Sender<MiniAct>,
+    mini_rx: Receiver<MiniAct>,
+}
+
+/// What the mini player shows. Updated by the main window every pass.
+#[derive(Default)]
+struct MiniState {
+    now: Option<NowPlaying>,
+    playing: bool,
+    loading: bool,
+    pos_ms: u32,
+    pos_at: Option<Instant>,
+    shuffle: bool,
+    repeat: Option<RepeatMode>,
+    seek_drag: Option<f32>,
+    /// The window had focus at least once, so losing it means "clicked away".
+    focused_once: bool,
+}
+
+impl MiniState {
+    fn position(&self) -> u32 {
+        let dur = self.now.as_ref().map_or(0, |n| n.duration_ms);
+        let p = match (self.playing, self.pos_at) {
+            (true, Some(at)) => self.pos_ms + at.elapsed().as_millis() as u32,
+            _ => self.pos_ms,
+        };
+        if dur > 0 { p.min(dur) } else { p }
+    }
+}
+
+/// Button presses in the mini player, handled by the main window.
+enum MiniAct {
+    Close,
+    OpenApp,
+    PlayPause,
+    Next,
+    Prev,
+    Shuffle,
+    Repeat,
+    Seek(u32),
 }
 
 impl App {
@@ -199,10 +261,21 @@ impl App {
         cmd: UnboundedSender<Command>,
         rx: Receiver<Event>,
     ) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
         let (sdk_tx, sdk_rx) = std::sync::mpsc::channel();
+        let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let (mini_tx, mini_rx) = std::sync::mpsc::channel();
+        crate::reopen::install({
+            let (tx, ctx) = (tray_tx.clone(), cc.egui_ctx.clone());
+            move || {
+                let _ = tx.send(TrayMsg::ShowApp);
+                ctx.request_repaint();
+            }
+        });
+        let tray = Tray::new(&cc.egui_ctx, tray_tx)
+            .map_err(|e| log::warn!("menu bar icon unavailable: {e:#}"))
+            .ok();
         let (sdk, error) = match Sdk::new(cc, sdk_tx, DEFAULT_VOLUME) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some((format!("Player failed to start: {e:#}"), Instant::now()))),
@@ -230,7 +303,7 @@ impl App {
             shuffle: false,
             repeat: RepeatMode::Off,
             devices: Vec::new(),
-            queue: Vec::new(),
+            queue: Arc::default(),
             saved: HashMap::new(),
             loading_play: None,
             sdk,
@@ -239,6 +312,14 @@ impl App {
             error,
             np_tab: NpTab::Queue,
             np_related: None,
+            tray,
+            tray_rx,
+            main_hidden: false,
+            quitting: false,
+            mini: None,
+            mini_state: Arc::new(Mutex::new(MiniState::default())),
+            mini_tx,
+            mini_rx,
         }
     }
 
@@ -327,7 +408,7 @@ impl App {
             image: None,
             context_uri,
             album_name: String::new(),
-            tracks: Vec::new(),
+            tracks: Arc::default(),
             next_offset: None,
             loading: true,
         });
@@ -341,7 +422,7 @@ impl App {
             image: p.image.clone(),
             context_uri: p.uri.clone(),
             album_name: String::new(),
-            tracks: Vec::new(),
+            tracks: Arc::default(),
             next_offset: None,
             loading: true,
         });
@@ -363,7 +444,7 @@ impl App {
             image: a.image.clone(),
             context_uri: a.uri.clone(),
             album_name: a.name.clone(),
-            tracks: Vec::new(),
+            tracks: Arc::default(),
             next_offset: None,
             loading: true,
         });
@@ -502,9 +583,9 @@ impl App {
                     if let View::Tracks(tv) = &mut self.view {
                         if tv.key == view {
                             if append {
-                                tv.tracks.extend(tracks);
+                                Arc::make_mut(&mut tv.tracks).extend(tracks);
                             } else {
-                                tv.tracks = tracks;
+                                tv.tracks = Arc::new(tracks);
                             }
                             tv.next_offset = next_offset;
                             tv.loading = false;
@@ -548,10 +629,136 @@ impl App {
                         (None, None) => {}
                     }
                 }
-                Event::Queue(q) => self.queue = q,
+                Event::Queue(q) => self.queue = Arc::new(q),
                 Event::Saved { uri, saved } => {
                     self.saved.insert(uri, saved);
                 }
+            }
+        }
+    }
+
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.tray_rx.try_recv() {
+            match msg {
+                TrayMsg::ToggleMini { anchor } => {
+                    log::debug!("tray click: mini open={} main_hidden={}", self.mini.is_some(), self.main_hidden);
+                    if self.mini.is_some() {
+                        self.mini = None;
+                    } else {
+                        // Physical screen pixels → points, centred under the icon.
+                        let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(2.0);
+                        let pos = anchor.map(|(x, y)| {
+                            Pos2::new((x / ppp as f64) as f32 - MINI_SIZE.x / 2.0, (y / ppp as f64) as f32 + 6.0)
+                        });
+                        self.open_mini(ctx, pos);
+                    }
+                }
+                TrayMsg::ShowMini => self.open_mini(ctx, None),
+                TrayMsg::PlayPause => self.toggle_play(),
+                TrayMsg::Next => {
+                    if let Some(sdk) = &self.sdk {
+                        sdk.next();
+                    }
+                }
+                TrayMsg::Prev => {
+                    if let Some(sdk) = &self.sdk {
+                        sdk.prev();
+                    }
+                }
+                TrayMsg::ShowApp => self.show_app(ctx),
+                TrayMsg::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn open_mini(&mut self, ctx: &egui::Context, pos: Option<Pos2>) {
+        // Without an anchor (menu item), sit at the top-right of the screen.
+        let pos = pos.or_else(|| {
+            ctx.input(|i| i.viewport().monitor_size)
+                .map(|m| Pos2::new(m.x - MINI_SIZE.x - 12.0, 34.0))
+        });
+        self.mini = Some(pos.map(|p| Pos2::new(p.x.max(8.0), p.y)));
+        if let Ok(mut st) = self.mini_state.lock() {
+            st.focused_once = false;
+            st.seek_drag = None;
+        }
+        ctx.send_viewport_cmd_to(mini_viewport_id(), egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    fn show_app(&mut self, ctx: &egui::Context) {
+        self.mini = None;
+        self.main_hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// The mini player is its own small borderless, always-on-top window. It is a
+    /// *deferred* viewport: eframe creates and paints it on its own events, which also
+    /// works while the main window is hidden (an immediate viewport can't be created
+    /// from that state and makes egui panic).
+    fn show_mini(&mut self, ctx: &egui::Context) {
+        let Some(pos) = self.mini else { return };
+        if let Ok(mut st) = self.mini_state.lock() {
+            st.now = self.now.clone();
+            st.playing = self.playing;
+            st.loading = self.loading_play.is_some();
+            st.pos_ms = self.pos_ms;
+            st.pos_at = Some(self.pos_at);
+            st.shuffle = self.shuffle;
+            st.repeat = Some(self.repeat);
+        }
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("rustune mini player")
+            .with_inner_size(MINI_SIZE)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top();
+        if let Some(p) = pos {
+            builder = builder.with_position(p);
+        }
+        let (state, tx) = (self.mini_state.clone(), self.mini_tx.clone());
+        ctx.show_viewport_deferred(mini_viewport_id(), builder, move |ui, _| {
+            let acts = mini_ui(ui, &state);
+            if !acts.is_empty() {
+                for a in acts {
+                    let _ = tx.send(a);
+                }
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
+        });
+    }
+
+    fn drain_mini(&mut self, ctx: &egui::Context) {
+        while let Ok(act) = self.mini_rx.try_recv() {
+            match act {
+                MiniAct::Close => {
+                    log::debug!("mini: close requested");
+                    self.mini = None;
+                }
+                MiniAct::OpenApp => self.show_app(ctx),
+                MiniAct::PlayPause => self.toggle_play(),
+                MiniAct::Next => {
+                    if let Some(sdk) = &self.sdk {
+                        sdk.next();
+                    }
+                }
+                MiniAct::Prev => {
+                    if let Some(sdk) = &self.sdk {
+                        sdk.prev();
+                    }
+                }
+                MiniAct::Shuffle => self.send(Command::Shuffle(!self.shuffle)),
+                MiniAct::Repeat => {
+                    self.repeat = self.repeat.next();
+                    self.send(Command::Repeat(self.repeat));
+                }
+                MiniAct::Seek(ms) => self.seek(ms),
             }
         }
     }
@@ -621,14 +828,18 @@ impl App {
 // ---- theme, fonts & drawing helpers ----------------------------------------
 
 /// Use the macOS system font (SF Pro) at two weights when available; egui's built-in
-/// fonts stay as fallbacks for symbols. Both weights share one copy of the font bytes.
+/// fonts stay as fallbacks for symbols. Both weights share one memory-mapped copy of the
+/// font file, so its 8 MB are paged in from disk as needed rather than copied.
 fn install_fonts(ctx: &egui::Context) {
     use egui::epaint::text::{FontTweak, VariationCoords};
     let mut fonts = egui::FontDefinitions::default();
     let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let mut bold_family = defaults.clone();
-    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
-        let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(bytes);
+    let file = std::fs::File::open("/System/Library/Fonts/SFNS.ttf");
+    // SAFETY: the font lives on the read-only system volume, so the mapped bytes can't
+    // change underneath us.
+    if let Ok(map) = file.and_then(|f| unsafe { memmap2::Mmap::map(&f) }) {
+        let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(map);
         let weight = |w: f32| FontTweak { coords: VariationCoords::new([("wght", w)]), ..Default::default() };
         fonts.font_data.insert(
             "sf".into(),
@@ -873,6 +1084,43 @@ fn wave_heights(seed: &str, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Waveform-style seek bar. `drag` holds the in-progress drag position. Returns the
+/// new position (0..1) when the user releases it.
+fn wave_bar(ui: &mut egui::Ui, width: f32, height: f32, seed: &str, frac: f32, drag: &mut Option<f32>) -> Option<f32> {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+    let n = ((width / 4.5) as usize).max(1);
+    let heights = wave_heights(seed, n);
+    let step = width / n as f32;
+    let hover = resp.hover_pos().map(|p| ((p.x - rect.left()) / width).clamp(0.0, 1.0));
+    let frac = drag.unwrap_or(frac);
+    let p = ui.painter();
+    for (i, h) in heights.iter().enumerate() {
+        let x = rect.left() + step * (i as f32 + 0.5);
+        let t = i as f32 / n as f32;
+        let color = if t <= frac {
+            ACCENT
+        } else if hover.is_some_and(|hv| t <= hv) {
+            Color32::from_rgb(0x8a, 0x5a, 0x56)
+        } else {
+            Color32::from_rgb(0x55, 0x40, 0x3e)
+        };
+        let bar = Rect::from_center_size(Pos2::new(x, rect.center().y), Vec2::new(step * 0.5, rect.height() * h));
+        p.rect_filled(bar, step * 0.25, color);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let at = resp.interact_pointer_pos().map(|p| ((p.x - rect.left()) / width).clamp(0.0, 1.0));
+    if resp.dragged() {
+        *drag = at;
+    }
+    if resp.drag_stopped() || resp.clicked() {
+        *drag = None;
+        return at;
+    }
+    None
+}
+
 /// Three little bars marking the current track in lists.
 fn eq_icon(ui: &mut egui::Ui, playing: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
@@ -887,9 +1135,35 @@ fn eq_icon(ui: &mut egui::Ui, playing: bool) {
 // ---- app -------------------------------------------------------------------
 
 impl eframe::App for App {
+    /// Clear to fully transparent: the main window paints over everything anyway, and
+    /// the mini player's rounded corners need to show what's behind the window.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_sdk();
+        self.drain_tray(ctx);
+        self.drain_mini(ctx);
+
+        // The red close button hides the window; music keeps playing from the menu bar.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            log::debug!("window closed to the menu bar");
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.main_hidden = true;
+            // Free the covers; the mini player reloads its one from the disk cache.
+            ctx.forget_all_images();
+        }
+        // Let the mini window draw while the main one is hidden or minimised.
+        if self.mini.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        }
+        if let Some(tray) = &mut self.tray {
+            let track = self.now.as_ref().map(|n| (n.name.as_str(), n.artists.as_str()));
+            tray.update(track, self.playing);
+        }
         if self.loading_play.is_some_and(|t| t.elapsed().as_secs() > 20) {
             self.loading_play = None;
         }
@@ -902,7 +1176,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_mini(ui.ctx());
+        if self.main_hidden {
+            return;
+        }
         paint_background(ui);
+        titlebar_drag(ui);
         match &self.auth {
             Auth::LoggedIn { .. } => {}
             _ => return self.login_screen(ui),
@@ -912,7 +1191,11 @@ impl eframe::App for App {
             self.player_bar(ui);
         }
         self.sidebar(ui);
-        let margin = if now_playing { Margin::ZERO } else { Margin { left: 8, right: 20, top: 16, bottom: 6 } };
+        let margin = if now_playing {
+            Margin::ZERO
+        } else {
+            Margin { left: 8, right: 20, top: TITLEBAR_H as i8 + 4, bottom: 6 }
+        };
         egui::CentralPanel::default()
             .frame(Frame::new().inner_margin(margin))
             .show(ui, |ui| {
@@ -994,7 +1277,7 @@ impl App {
             .resizable(false)
             .exact_size(250.0)
             .show_separator_line(false)
-            .frame(Frame::new().inner_margin(Margin { left: 14, right: 6, top: 14, bottom: 14 }))
+            .frame(Frame::new().inner_margin(Margin { left: 14, right: 6, top: TITLEBAR_H as i8 + 6, bottom: 14 }))
             .show(ui, |ui| {
                 glass(22, 14).show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
@@ -1268,38 +1551,8 @@ impl App {
 
     /// Waveform-style seek bar. Returns the new position (0..1) when the user releases it.
     fn waveform(&mut self, ui: &mut egui::Ui, width: f32, height: f32, frac: f32) -> Option<f32> {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
-        let seed = self.now.as_ref().map_or("rustune", |n| n.uri.as_str());
-        let n = ((width / 4.5) as usize).max(1);
-        let heights = wave_heights(seed, n);
-        let step = width / n as f32;
-        let hover = resp.hover_pos().map(|p| ((p.x - rect.left()) / width).clamp(0.0, 1.0));
-        let p = ui.painter();
-        for (i, h) in heights.iter().enumerate() {
-            let x = rect.left() + step * (i as f32 + 0.5);
-            let t = i as f32 / n as f32;
-            let color = if t <= frac {
-                ACCENT
-            } else if hover.is_some_and(|hv| t <= hv) {
-                Color32::from_rgb(0x8a, 0x5a, 0x56)
-            } else {
-                Color32::from_rgb(0x55, 0x40, 0x3e)
-            };
-            let bar = Rect::from_center_size(Pos2::new(x, rect.center().y), Vec2::new(step * 0.5, rect.height() * h));
-            p.rect_filled(bar, step * 0.25, color);
-        }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let at = resp.interact_pointer_pos().map(|p| ((p.x - rect.left()) / width).clamp(0.0, 1.0));
-        if resp.dragged() {
-            self.seek_drag = at;
-        }
-        if resp.drag_stopped() || resp.clicked() {
-            self.seek_drag = None;
-            return at;
-        }
-        None
+        let seed = self.now.as_ref().map_or("rustune", |n| n.uri.as_str()).to_string();
+        wave_bar(ui, width, height, &seed, frac, &mut self.seek_drag)
     }
 
     // ---- Home ----
@@ -1637,7 +1890,7 @@ impl App {
                                 image: a.image.clone(),
                                 context_uri: a.uri.clone(),
                                 album_name: a.name.clone(),
-                                tracks: Vec::new(),
+                                tracks: Arc::default(),
                                 next_offset: None,
                                 loading: true,
                             }),
@@ -1779,7 +2032,7 @@ impl App {
             }
 
             // Similar (same genre)
-            match &similar {
+            match similar.as_deref() {
                 None => {
                     section_title(ui, "You might also like");
                     ui.spinner();
@@ -1825,7 +2078,7 @@ impl App {
         let main = Rect::from_min_max(full.min, Pos2::new(full.right() - queue_w, full.bottom()));
 
         // Top bar
-        let top = Rect::from_min_size(main.min + Vec2::new(18.0, 14.0), Vec2::new(main.width() - 36.0, 44.0));
+        let top = Rect::from_min_size(main.min + Vec2::new(18.0, TITLEBAR_H), Vec2::new(main.width() - 36.0, 44.0));
         let mut top_ui = ui.new_child(egui::UiBuilder::new().max_rect(top).layout(Layout::left_to_right(Align::Center)));
         if icons::button(&mut top_ui, Icon::ChevronDown, 22.0, TEXT, Color32::WHITE).on_hover_text("Close").clicked() {
             self.back();
@@ -1918,7 +2171,7 @@ impl App {
         // Side panel: Up next / From the album / More by the artist
         if queue_w > 0.0 {
             let q = Rect::from_min_max(
-                Pos2::new(full.right() - queue_w + 4.0, full.top() + 16.0),
+                Pos2::new(full.right() - queue_w + 4.0, full.top() + TITLEBAR_H + 6.0),
                 full.right_bottom() - Vec2::new(16.0, 16.0),
             );
             let mut q_ui = ui.new_child(egui::UiBuilder::new().max_rect(q).layout(Layout::top_down(Align::Min)));
@@ -1933,7 +2186,7 @@ impl App {
                 });
                 ui.add_space(10.0);
                 let related = self.np_related.as_ref();
-                let (list, empty): (Option<Vec<TrackRow>>, &str) = match self.np_tab {
+                let (list, empty): (Option<Arc<Vec<TrackRow>>>, &str) = match self.np_tab {
                     NpTab::Queue => (Some(self.queue.clone()), "Nothing queued."),
                     NpTab::Album => (related.and_then(|r| r.album.clone()), "No album tracks."),
                     NpTab::Artist => (related.and_then(|r| r.by_artist.clone()), "Nothing else by this artist."),
@@ -2155,7 +2408,149 @@ impl App {
     }
 }
 
+fn mini_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rustune-mini")
+}
+
+/// The mini player window's UI. Runs on its own (deferred viewport), so it reads a
+/// shared snapshot and reports button presses instead of touching the app directly.
+fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
+    let mut acts = Vec::new();
+    let Ok(mut st) = state.lock() else { return acts };
+    let ctx = ui.ctx().clone();
+
+    // Popover behaviour: clicking elsewhere closes it.
+    match ctx.input(|i| i.viewport().focused) {
+        Some(true) => st.focused_once = true,
+        Some(false) if st.focused_once => {
+            log::debug!("mini: lost focus, closing");
+            acts.push(MiniAct::Close);
+            return acts;
+        }
+        _ => {}
+    }
+    if st.playing || st.loading {
+        ctx.request_repaint_after(std::time::Duration::from_millis(if st.loading { 40 } else { 500 }));
+    }
+
+    // Card: dark base, the cover stretched across it as a soft colour wash (like the
+    // Now Playing backdrop), a dark veil for legibility, and a thin rim. All layers
+    // share the same rounding, so there are no seams.
+    let r = ui.max_rect();
+    ui.painter().rect_filled(r, 20.0, Color32::from_rgb(0x1a, 0x0f, 0x0f));
+    if let Some(url) = st.now.as_ref().and_then(|n| n.cover.clone()) {
+        egui::Image::from_uri(url)
+            .corner_radius(20)
+            .tint(Color32::from_white_alpha(70))
+            .paint_at(ui, r);
+    }
+    let p = ui.painter();
+    p.rect_filled(r, 20.0, Color32::from_rgba_premultiplied(14, 8, 8, 170));
+    p.rect_stroke(r.shrink(0.5), 20.0, Stroke::new(1.0, GLASS_STROKE), egui::StrokeKind::Inside);
+    // Drag the background to move the mini player.
+    if ui.interact(r, egui::Id::unique("mini_drag"), Sense::drag()).drag_started() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    let inner = r.shrink2(Vec2::new(16.0, 14.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.y = 4.0;
+    let w = inner.width();
+
+    // Cover, title, open/close
+    ui.horizontal(|ui| {
+        art(ui, st.now.as_ref().and_then(|n| n.cover.as_deref()), 60.0, 14);
+        ui.vertical(|ui| {
+            ui.set_width(w - 60.0 - 10.0 - 2.0 * icons::button_side(14.0) - 16.0);
+            ui.add_space(8.0);
+            match &st.now {
+                Some(n) => {
+                    ui.add(egui::Label::new(RichText::new(&n.name).font(bold(15.0))).truncate().selectable(false));
+                    ui.add(egui::Label::new(RichText::new(&n.artists).size(12.5).color(MUTED)).truncate().selectable(false));
+                }
+                None => {
+                    ui.label(RichText::new("Nothing playing").font(bold(15.0)).color(MUTED));
+                    ui.label(RichText::new("Pick a song in rustune").size(12.5).color(DIM));
+                }
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            if icons::button(ui, Icon::Close, 14.0, DIM, TEXT).on_hover_text("Close").clicked() {
+                acts.push(MiniAct::Close);
+            }
+            if icons::button(ui, Icon::Expand, 14.0, DIM, TEXT).on_hover_text("Open rustune").clicked() {
+                acts.push(MiniAct::OpenApp);
+            }
+        });
+    });
+
+    // Transport: same layout rules as the main player (equal slots, one centre line).
+    let (icon, play, gap) = (16.0_f32, 38.0_f32, 16.0_f32);
+    let small = icons::button_side(icon);
+    let (row, _) = ui.allocate_exact_size(Vec2::new(w, play + 8.0), Sense::hover());
+    let total = small * 4.0 + play + gap * 4.0;
+    let mut x = row.center().x - total / 2.0;
+    let mut slot = |size: f32| {
+        let rect = Rect::from_center_size(Pos2::new(x + size / 2.0, row.center().y), Vec2::splat(size));
+        x += size + gap;
+        rect
+    };
+    let toggle = |on: bool| if on { (ACCENT, ACCENT_HOVER) } else { (MUTED, TEXT) };
+    let (sc, sh) = toggle(st.shuffle);
+    if icons::button_at(ui, slot(small), Icon::Shuffle, icon, sc, sh).on_hover_text("Shuffle").clicked() {
+        acts.push(MiniAct::Shuffle);
+    }
+    if icons::button_at(ui, slot(small), Icon::SkipPrev, icon, TEXT, Color32::WHITE).clicked() {
+        acts.push(MiniAct::Prev);
+    }
+    if play_button_at(ui, slot(play), st.playing, st.loading).clicked() {
+        acts.push(MiniAct::PlayPause);
+    }
+    if icons::button_at(ui, slot(small), Icon::SkipNext, icon, TEXT, Color32::WHITE).clicked() {
+        acts.push(MiniAct::Next);
+    }
+    let repeat = st.repeat.unwrap_or(RepeatMode::Off);
+    let (rc, rh) = toggle(repeat != RepeatMode::Off);
+    let glyph = if repeat == RepeatMode::Track { Icon::RepeatOne } else { Icon::Repeat };
+    if icons::button_at(ui, slot(small), glyph, icon, rc, rh).on_hover_text(repeat.label()).clicked() {
+        acts.push(MiniAct::Repeat);
+    }
+
+    // Progress
+    let dur = st.now.as_ref().map_or(0, |n| n.duration_ms);
+    let pos = st.position();
+    ui.horizontal(|ui| {
+        ui.add_sized([40.0, 16.0], egui::Label::new(RichText::new(fmt_ms(pos)).size(11.5).color(MUTED)));
+        let seed = st.now.as_ref().map_or("rustune".to_string(), |n| n.uri.clone());
+        let frac = if dur > 0 { pos as f32 / dur as f32 } else { 0.0 };
+        let mut drag = st.seek_drag;
+        if let Some(new) = wave_bar(ui, w - 100.0, 16.0, &seed, frac, &mut drag) {
+            if dur > 0 {
+                acts.push(MiniAct::Seek((new * dur as f32) as u32));
+            }
+        }
+        st.seek_drag = drag;
+        ui.add_sized([40.0, 16.0], egui::Label::new(RichText::new(fmt_ms(dur)).size(11.5).color(MUTED)));
+    });
+    acts
+}
+
 // ---- reusable rows/cards ----------------------------------------------------
+
+/// The window has no visible title bar, so the top strip acts as one: drag to move,
+/// double-click to zoom. Registered first, so real widgets in the strip still win.
+fn titlebar_drag(ui: &mut egui::Ui) {
+    let strip = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width(), TITLEBAR_H));
+    let resp = ui.interact(strip, egui::Id::unique("titlebar_drag"), Sense::click_and_drag());
+    if resp.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if resp.double_clicked() {
+        let maximized = ui.ctx().input(|i| i.viewport().maximized).unwrap_or(false);
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+}
 
 fn search_pill(ui: &mut egui::Ui, width: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 42.0), Sense::click());
