@@ -5,6 +5,7 @@ mod icons;
 mod lyrics;
 mod reopen;
 mod sdk;
+mod spaces;
 mod tray;
 mod ui;
 
