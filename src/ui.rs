@@ -35,6 +35,8 @@ const TITLEBAR_H: f32 = 32.0;
 const MINI_SIZE: Vec2 = Vec2::new(360.0, 172.0);
 /// Extra height of the mini player while it shows lyrics.
 const MINI_LYRICS_H: f32 = 64.0;
+/// The mini player's window title (also how its native window is found).
+const MINI_TITLE: &str = "rustune mini player";
 
 /// Starting volume for the SDK player (0..1).
 const DEFAULT_VOLUME: f32 = 0.6;
@@ -299,6 +301,8 @@ struct MiniState {
     seek_drag: Option<f32>,
     /// The window had focus at least once, so losing it means "clicked away".
     focused_once: bool,
+    /// The window has been set to show on every Space and over full-screen apps.
+    floating: bool,
     show_lyrics: bool,
     /// The playing song's lyrics, once loaded.
     lyrics: Option<Arc<Lyrics>>,
@@ -834,7 +838,7 @@ impl App {
                 TrayMsg::ToggleMini { anchor } => {
                     log::debug!("tray click: mini open={} main_hidden={}", self.mini.is_some(), self.main_hidden);
                     if self.mini.is_some() {
-                        self.mini = None;
+                        self.close_mini();
                     } else {
                         // Physical screen pixels → points, centred under the icon.
                         let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(2.0);
@@ -858,6 +862,7 @@ impl App {
                 }
                 TrayMsg::ShowApp => self.show_app(ctx),
                 TrayMsg::Quit => {
+                    self.close_mini();
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -872,16 +877,28 @@ impl App {
                 .map(|m| Pos2::new(m.x - MINI_SIZE.x - 12.0, 34.0))
         });
         self.mini = Some(pos.map(|p| Pos2::new(p.x.max(8.0), p.y)));
+        // Only background apps' windows may show over another app's full-screen Space.
+        crate::spaces::set_background_app(true);
         if let Ok(mut st) = self.mini_state.lock() {
             st.focused_once = false;
             st.seek_drag = None;
+            // The new window is set up to float over every Space, then focused (see
+            // `mini_ui`).
+            st.floating = false;
         }
-        ctx.send_viewport_cmd_to(mini_viewport_id(), egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
 
+    /// Close the mini player (only that window; the app keeps running).
+    fn close_mini(&mut self) {
+        if self.mini.take().is_some() {
+            // Back to a normal app with its Dock icon (see `open_mini`).
+            crate::spaces::set_background_app(false);
+        }
+    }
+
     fn show_app(&mut self, ctx: &egui::Context) {
-        self.mini = None;
+        self.close_mini();
         self.main_hidden = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -922,7 +939,7 @@ impl App {
         }
         let size = if self.mini_lyrics { MINI_SIZE + Vec2::new(0.0, MINI_LYRICS_H) } else { MINI_SIZE };
         let mut builder = egui::ViewportBuilder::default()
-            .with_title("rustune mini player")
+            .with_title(MINI_TITLE)
             .with_inner_size(size)
             .with_resizable(false)
             .with_decorations(false)
@@ -948,7 +965,7 @@ impl App {
             match act {
                 MiniAct::Close => {
                     log::debug!("mini: close requested");
-                    self.mini = None;
+                    self.close_mini();
                 }
                 MiniAct::OpenApp => self.show_app(ctx),
                 MiniAct::PlayPause => self.toggle_play(),
@@ -2960,6 +2977,13 @@ fn mini_ui(ui: &mut egui::Ui, state: &Mutex<MiniState>) -> Vec<MiniAct> {
     let mut acts = Vec::new();
     let Ok(mut st) = state.lock() else { return acts };
     let ctx = ui.ctx().clone();
+
+    // Float over whatever is on screen before taking focus: focusing a window that
+    // lives on another Space would switch the screen to that Space.
+    if !st.floating && crate::spaces::float_everywhere(MINI_TITLE) {
+        st.floating = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
 
     // Popover behaviour: clicking elsewhere closes it.
     match ctx.input(|i| i.viewport().focused) {
