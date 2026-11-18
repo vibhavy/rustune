@@ -7,6 +7,26 @@ use std::time::Duration;
 
 const BASE: &str = "https://api.spotify.com/v1";
 
+/// A Web API call that came back with an error status.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Spotify API {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// True if `e` is a Web API error with this status.
+pub fn has_status(e: &anyhow::Error, status: reqwest::StatusCode) -> bool {
+    e.downcast_ref::<ApiError>().is_some_and(|a| a.status == status)
+}
+
 #[derive(Clone, Debug)]
 pub struct TrackRow {
     pub uri: String,
@@ -405,7 +425,7 @@ impl WebApi {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                bail!("Spotify API {status}: {}", body.chars().take(200).collect::<String>());
+                return Err(ApiError { status, body: body.chars().take(200).collect() }.into());
             }
             return Ok(resp);
         }

@@ -281,6 +281,9 @@ pub struct App {
     np_lyrics: bool,
     /// The mini player shows lyrics under the controls.
     mini_lyrics: bool,
+    /// Set when Spotify lost the player: the command to send again once it's back,
+    /// and when that started (a second loss soon after gives up).
+    device_retry: Option<(Option<Command>, Instant)>,
 }
 
 /// What the mini player shows. Updated by the main window every pass.
@@ -399,6 +402,7 @@ impl App {
             lyrics_line: None,
             np_lyrics: false,
             mini_lyrics: false,
+            device_retry: None,
         }
     }
 
@@ -792,6 +796,23 @@ impl App {
                 Event::Saved { uri, saved } => {
                     self.saved.insert(uri, saved);
                 }
+                Event::DeviceLost(cmd) => {
+                    let recent = self.device_retry.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs() < 30);
+                    match &self.sdk {
+                        Some(sdk) if !recent => {
+                            self.device_retry = Some((Some(cmd), Instant::now()));
+                            sdk.reconnect();
+                        }
+                        _ => {
+                            self.device_retry = None;
+                            self.loading_play = None;
+                            self.error = Some((
+                                "Spotify can't reach the player on this Mac. Try again in a moment.".into(),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
                 Event::Lyrics { uri, result } => {
                     if let Some((u, state)) = &mut self.lyrics
                         && *u == uri
@@ -959,6 +980,10 @@ impl App {
                 SdkMsg::Ready { device_id } => {
                     log::info!("SDK player ready: {device_id}");
                     self.send(Command::SetDevice(Some(device_id)));
+                    if let Some(cmd) = self.device_retry.as_mut().and_then(|(cmd, _)| cmd.take()) {
+                        log::info!("player reconnected; sending {cmd:?} again");
+                        self.send(cmd);
+                    }
                 }
                 SdkMsg::NotReady => {
                     self.local_active = false;

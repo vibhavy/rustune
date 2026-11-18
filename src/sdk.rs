@@ -105,6 +105,11 @@ impl Sdk {
     pub fn seek(&self, ms: u32) {
         self.eval(&format!("window.rt.player.seek({ms})"));
     }
+    /// Register the player with Spotify again (it forgets it after the Mac sleeps).
+    /// The SDK reports `Ready` once it's back.
+    pub fn reconnect(&self) {
+        self.eval("window.rt.player.disconnect(); window.rt.player.connect()");
+    }
     pub fn set_volume(&self, v: f32) {
         self.eval(&format!("window.rt.player.setVolume({})", v.clamp(0.0, 1.0)));
     }
