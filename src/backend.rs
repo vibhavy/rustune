@@ -110,7 +110,7 @@ pub enum ViewKey {
     Show(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
     Login,
     Logout,
@@ -190,6 +190,9 @@ pub enum Event {
     Song { uri: String, section: SongSection },
     Queue(Vec<TrackRow>),
     Saved { uri: String, saved: bool },
+    /// Spotify no longer knows this Mac's player (it drops it after the Mac sleeps), so
+    /// this command failed. The UI reconnects the player and sends it again.
+    DeviceLost(Command),
     /// `Ok(None)`: the song has no lyrics.
     Lyrics { uri: String, result: Result<Option<crate::lyrics::Lyrics>, String> },
 }
@@ -411,8 +414,19 @@ async fn run(ui: Ui, mut rx: UnboundedReceiver<Command>) {
                         device.clone(),
                     );
                     tokio::spawn(async move {
+                        let replay = matches!(
+                            other,
+                            Command::PlayContext { .. } | Command::PlayTracks { .. } | Command::TransferHere
+                        )
+                        .then(|| other.clone());
                         let res = web_command(&ui, &api, &web, session.as_ref(), device, other).await;
-                        if let Err(e) = res {
+                        if let Err(e) = &res
+                            && crate::api::has_status(e, reqwest::StatusCode::NOT_FOUND)
+                            && let Some(cmd) = replay
+                        {
+                            log::warn!("player device unknown to Spotify ({e:#}); reconnecting");
+                            ui.send(Event::DeviceLost(cmd));
+                        } else if let Err(e) = res {
                             ui.error(e);
                         }
                     });
